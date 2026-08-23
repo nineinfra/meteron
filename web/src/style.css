@@ -66,7 +66,7 @@ body {
 
 /* ---- 视图容器 ---- */
 .view { width: 100%; max-width: 1720px; margin: 0 auto; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: 16px; }
-.chat-view { max-width: 1200px; height: 100%; padding-bottom: 24px; min-height: 0; }
+.chat-view { max-width: 1720px; height: 100%; padding-bottom: 24px; min-height: 0; }
 .grow { flex: 1; min-height: 0; }
 
 /* ---- 按钮 / 输入 ---- */
