@@ -65,8 +65,8 @@ body {
 .content { flex: 1; overflow-y: auto; }
 
 /* ---- 视图容器 ---- */
-.view { max-width: 1180px; margin: 0 auto; padding: 20px 24px 48px; display: flex; flex-direction: column; gap: 16px; }
-.chat-view { max-width: 900px; height: 100%; padding-bottom: 24px; min-height: 0; }
+.view { width: 100%; max-width: 1720px; margin: 0 auto; padding: 20px 28px 48px; display: flex; flex-direction: column; gap: 16px; }
+.chat-view { max-width: 1200px; height: 100%; padding-bottom: 24px; min-height: 0; }
 .grow { flex: 1; min-height: 0; }
 
 /* ---- 按钮 / 输入 ---- */
