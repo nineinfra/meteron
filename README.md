@@ -24,16 +24,22 @@ docker compose -f deploy/docker-compose.yml up -d --build   # 启动全栈 + Met
 
 ## Web 控制台
 
-启动后浏览器打开 **`http://localhost:8080/`**，输入 API Key（开发环境默认
-`mk_meteron_bootstrap_dev_key`）即可看到：
+API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对内网，API 端点对外服务）：
 
-- **KPI 卡片**：请求数、输入/输出/缓存命中 tokens（支持 24h / 7d / 30d 切换）
-- **用量趋势图**：小时粒度输入/输出 token 堆叠柱状图（超 96 点自动按天聚合）
-- **用量明细**：按模型 × Provider × 任务类型的 token 消耗与请求数
-- **预算池**：实时余额、花费进度条（80% 预警 / 100% 告警变色）、在途预留、超支策略
-- **账单**：金额、账期、状态，draft 账单一键定稿
+| 端点 | 端口 | 内容 |
+|---|---|---|
+| API/网关 | `:8080` | `/v1/chat/completions`、`/api/v1/*`、`/metrics`、`/healthz` |
+| Web 控制台 | `:9080` | 浏览器访问的 UI（内置反向代理调用 API，同源无 CORS） |
 
-控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），每 60 秒自动刷新。
+启动后浏览器打开 **`http://localhost:9080/`**，输入 API Key（开发环境默认
+`mk_meteron_bootstrap_dev_key`），左侧菜单两个界面：
+
+- **监控看板**：KPI 卡片（请求数、输入/输出/缓存 tokens，24h/7d/30d 切换）、用量趋势图、
+  按模型聚合的用量明细、预算池实时余额与进度条、账单管理（draft 一键定稿）
+- **模型对话**：与模型流式聊天（支持思考模型 reasoning 展示），每轮显示 token 用量，
+  对话产生的用量实时进入监控看板
+
+控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），监控数据每 60 秒自动刷新。
 
 ## 30 秒手工体验
 

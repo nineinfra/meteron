@@ -2,7 +2,7 @@
 import { ref, reactive, nextTick, onMounted, computed } from 'vue'
 import { session, api } from '../api.js'
 
-// 大语言模型聊天窗口：走网关 /v1/chat/completions（SSE 流式），
+// 模型对话页：走网关 /v1/chat/completions（SSE 流式），
 // 每轮对话经过完整的计量链路（预算预留 → 转发 → usage 确认 → Kafka 计量）。
 const props = defineProps({ customers: { type: Array, default: () => [] } })
 
@@ -14,10 +14,23 @@ const sending = ref(false)
 const errMsg = ref('')
 const listEl = ref(null)
 
-const messages = reactive([]) // { role:'user'|'assistant', content, usage? }
+const messages = reactive([]) // { role:'user'|'assistant', content, reasoning?, usage? }
 
 const customerOptions = computed(() =>
   props.customers.map((c) => ({ value: c.external_id || c.id, label: c.name })))
+
+// 会话累计（本页内存）：轮次与 token 汇总
+const sessionStat = computed(() => {
+  let turns = 0, inTok = 0, outTok = 0
+  for (const m of messages) {
+    if (m.role === 'assistant') {
+      turns++
+      inTok += m.usage?.prompt_tokens || 0
+      outTok += m.usage?.completion_tokens || 0
+    }
+  }
+  return { turns, inTok, outTok }
+})
 
 onMounted(async () => {
   try {
@@ -30,11 +43,6 @@ onMounted(async () => {
     customer.value = hit ? hit.value : (customerOptions.value[0]?.value || '')
   }
 })
-
-function modelLabel(m) {
-  const info = models.value.find((x) => x.model === m)
-  return info ? `${m}（${info.provider}）` : m
-}
 
 function scrollBottom() {
   nextTick(() => {
@@ -81,7 +89,7 @@ async function send() {
       throw new Error(msg)
     }
 
-    // 解析 SSE 流：delta.content 增量拼接，末 chunk 带 usage
+    // 解析 SSE 流：delta.content / delta.reasoning 增量拼接，末 chunk 带 usage
     const reader = res.body.getReader()
     const dec = new TextDecoder()
     let buf = ''
@@ -122,15 +130,9 @@ function clearChat() {
 </script>
 
 <template>
-  <section class="card">
-    <div class="card-head">
-      <h2>模型对话</h2>
-      <span class="muted small">经网关计量：预算预留 → 转发上游 → usage 确认入账</span>
-      <span class="spacer"></span>
-      <button class="btn ghost" @click="clearChat" :disabled="!messages.length || sending">清空</button>
-    </div>
-
-    <div class="chat-toolbar">
+  <div class="view chat-view">
+    <!-- 工具栏 -->
+    <section class="card chat-bar">
       <label class="ctl">模型
         <input v-model="model" list="model-options" placeholder="模型名" :disabled="sending">
         <datalist id="model-options">
@@ -143,11 +145,20 @@ function clearChat() {
           <option v-for="c in customerOptions" :key="c.value" :value="c.value">{{ c.label }}</option>
         </select>
       </label>
-    </div>
+      <span class="spacer"></span>
+      <span class="muted small" v-if="sessionStat.turns">
+        本会话：{{ sessionStat.turns }} 轮 · ↑{{ sessionStat.inTok }} ↓{{ sessionStat.outTok }} tokens
+      </span>
+      <button class="btn ghost" @click="clearChat" :disabled="!messages.length || sending">清空会话</button>
+    </section>
 
-    <div class="chat-list" ref="listEl">
+    <!-- 消息列表（占满剩余高度） -->
+    <div class="chat-list grow" ref="listEl">
       <div v-if="!messages.length" class="chat-empty">
-        与模型对话，token 用量将实时进入下方计量看板（默认模型：{{ models.length ? models[0].model : '-' }}）
+        <div class="chat-welcome">
+          <p>与模型对话，token 用量将实时进入「监控看板」</p>
+          <p class="muted small">默认模型：{{ models.length ? models[0].model : '-' }}（可在上方切换）</p>
+        </div>
       </div>
       <div v-for="(m, i) in messages" :key="i" class="chat-msg" :class="m.role">
         <div class="bubble">
@@ -170,10 +181,11 @@ function clearChat() {
 
     <p class="chat-err">{{ errMsg }}</p>
 
+    <!-- 输入区 -->
     <div class="chat-input">
       <textarea v-model="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"
         :disabled="sending" @keydown.enter.exact.prevent="send"></textarea>
       <button class="btn primary" @click="send" :disabled="sending || !input.trim()">发送</button>
     </div>
-  </section>
+  </div>
 </template>

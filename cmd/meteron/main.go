@@ -6,8 +6,11 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -113,22 +116,28 @@ func main() {
 	apiServer := api.NewServer(db, ch, authSvc, ledgerSvc, pricingEngine, producer,
 		billingWorker, cfg, log)
 
-	// ---- HTTP 路由 ----
-	mux := http.NewServeMux()
-	mux.Handle("/v1/chat/completions", gw)
-	mux.Handle("/api/v1/", apiServer.Handler())
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// ---- HTTP 路由（API 与 Web 控制台分离端点）----
+	// API 端点（默认 :8080）：OpenAI 兼容网关 + 管理 API + 运维探针
+	apiMux := http.NewServeMux()
+	apiMux.Handle("/v1/chat/completions", gw)
+	apiMux.Handle("/api/v1/", apiServer.Handler())
+	apiMux.Handle("/metrics", promhttp.Handler())
+	apiMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	// Web 控制台（内嵌静态资源，精确路径优先级高于 "/"）
-	mux.Handle("/", ui.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           mux,
+		Handler:           apiMux,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	// Console 端点（默认 :9080）：Web UI 静态资源 + 反向代理 /api、/v1 到 API 端点
+	// （同源代理，浏览器无需 CORS；控制台可只在内网暴露，API 端点独立对外）
+	var consoleSrv *http.Server
+	if cfg.Server.ConsoleAddr != "" {
+		consoleSrv = newConsoleServer(cfg.Server.Addr, cfg.Server.ConsoleAddr, log)
 	}
 
 	// ---- 后台 Worker ----
@@ -164,12 +173,20 @@ func main() {
 
 	// ---- 启动 HTTP ----
 	go func() {
-		log.Info("meteron listening", "addr", cfg.Server.Addr)
+		log.Info("meteron api listening", "addr", cfg.Server.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http server error", "err", err)
 			stop()
 		}
 	}()
+	if consoleSrv != nil {
+		go func() {
+			log.Info("meteron console listening", "addr", cfg.Server.ConsoleAddr)
+			if err := consoleSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("console server error", "err", err)
+			}
+		}()
+	}
 
 	<-ctx.Done()
 	log.Info("shutting down...")
@@ -179,5 +196,42 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http shutdown error", "err", err)
 	}
+	if consoleSrv != nil {
+		if err := consoleSrv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("console shutdown error", "err", err)
+		}
+	}
 	log.Info("meteron stopped")
+}
+
+// newConsoleServer 构建 Web 控制台服务：静态 UI + /api、/v1 反向代理到 API 端点。
+func newConsoleServer(apiAddr, consoleAddr string, log *slog.Logger) *http.Server {
+	// API 地址统一补全为绝对 URL（":8080" → "http://127.0.0.1:8080"）
+	if !strings.Contains(apiAddr, "://") {
+		apiAddr = "http://" + strings.TrimPrefix(apiAddr, "http://")
+		if strings.HasPrefix(apiAddr, "http://:") {
+			apiAddr = "http://127.0.0.1" + strings.TrimPrefix(apiAddr, "http://")
+		}
+	}
+	origin, err := url.Parse(apiAddr)
+	if err != nil {
+		log.Error("console proxy target invalid", "target", apiAddr, "err", err)
+		return nil
+	}
+	proxy := httputil.NewSingleHostReverseProxy(origin)
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/", proxy)
+	mux.Handle("/v1/", proxy)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.Handle("/", ui.Handler())
+
+	return &http.Server{
+		Addr:              consoleAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 }

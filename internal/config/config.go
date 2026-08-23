@@ -36,7 +36,8 @@ type Business struct {
 
 type Config struct {
 	Server struct {
-		Addr string `yaml:"addr"` // ":8080"
+		Addr        string `yaml:"addr"`         // API/网关端点 ":8080"（/v1 /api/v1 /metrics）
+		ConsoleAddr string `yaml:"console_addr"` // Web 控制台端点 ":9080"（静态 UI + 反代 API）
 	} `yaml:"server"`
 	PGDSN         string           `yaml:"pg_dsn"`
 	ClickHouseDSN string           `yaml:"clickhouse_dsn"`
@@ -52,6 +53,7 @@ type Config struct {
 func Default() *Config {
 	c := &Config{}
 	c.Server.Addr = ":8080"
+	c.Server.ConsoleAddr = ":9080"
 	c.PGDSN = "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
 	c.ClickHouseDSN = "clickhouse://meteron:meteron123@localhost:9000/meteron"
 	c.KafkaBrokers = []string{"localhost:9092"}
@@ -133,6 +135,7 @@ func applyEnv(c *Config) {
 	set("METERON_AES_KEY", func(v string) { c.AESKey = v })
 	set("METERON_BOOTSTRAP_API_KEY", func(v string) { c.BootstrapKey = v })
 	set("METERON_SERVER_ADDR", func(v string) { c.Server.Addr = v })
+	set("METERON_CONSOLE_ADDR", func(v string) { c.Server.ConsoleAddr = v })
 	set("METERON_EVENT_LOOKBACK_WINDOW_DAYS", func(v string) {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Business.EventLookbackWindowDays = n
