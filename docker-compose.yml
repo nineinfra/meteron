@@ -1,0 +1,97 @@
+# Meteron 本地开发栈：PG + ClickHouse + Redis + Kafka(KRaft) + Meteron
+# 启动：docker compose up -d --build
+# Demo：./scripts/demo.sh
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: meteron
+      POSTGRES_PASSWORD: meteron123
+      POSTGRES_DB: meteron
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meteron -d meteron"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    environment:
+      CLICKHOUSE_USER: meteron
+      CLICKHOUSE_PASSWORD: meteron123
+      CLICKHOUSE_DB: meteron
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user meteron --password meteron123 --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      # KRaft 单节点（无 Zookeeper）
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafkadata:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  meteron:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      METERON_SERVER_ADDR: ":8080"
+      METERON_PG_DSN: "host=postgres port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
+      METERON_CLICKHOUSE_DSN: "clickhouse://meteron:meteron123@clickhouse:9000/meteron"
+      METERON_KAFKA_BROKERS: "kafka:9092"
+      METERON_KAFKA_TOPIC: "meteron.meter-events"
+      METERON_REDIS_ADDR: "redis:6379"
+      METERON_AES_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      METERON_BOOTSTRAP_API_KEY: "mk_meteron_bootstrap_dev_key"
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  chdata:
+  kafkadata:

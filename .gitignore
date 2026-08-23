@@ -1,0 +1,15 @@
+# 构建产物
+/meteron
+/meteron.exe
+*.exe
+*.test
+*.out
+
+# 本地环境
+.env
+*.local.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,4 @@
+.git
+*.md
+scripts/
+config.yaml

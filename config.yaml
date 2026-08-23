@@ -1,0 +1,47 @@
+# Meteron 配置样例（本地开发默认值）
+# 优先级：默认值 < 本文件 < 环境变量（METERON_*）
+# Docker 部署见 docker-compose.yml（全部通过环境变量注入）
+
+server:
+  addr: ":8080"
+
+pg_dsn: "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
+clickhouse_dsn: "clickhouse://meteron:meteron123@localhost:9000/meteron"
+kafka_brokers:
+  - "localhost:9092"
+kafka_topic: "meteron.meter-events"
+redis_addr: "localhost:6379"
+
+# 32字节 hex（64字符）。生产环境务必更换并妥善保管
+aes_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+# 首次启动引导 API Key（明文，仅初始化用；生产环境启动后应轮换）
+bootstrap_api_key: "mk_meteron_bootstrap_dev_key"
+
+providers:
+  - name: mock
+    type: mock
+    models:
+      - mock-chat
+      - mock-cheap
+  # - name: openai-main
+  #   type: openai
+  #   base_url: "https://api.openai.com/v1"
+  #   api_key: "${OPENAI_API_KEY}"
+  #   models: ["gpt-4o", "gpt-4o-mini"]
+  # - name: anthropic-main
+  #   type: anthropic
+  #   base_url: "https://api.anthropic.com"
+  #   api_key: "${ANTHROPIC_API_KEY}"
+  #   models: ["claude-sonnet-4-5", "claude-haiku-4-5"]
+
+business:
+  event_lookback_window_days: 34   # 晚到事件回溯窗口
+  reserve_default_ttl_seconds: 60  # 预算预留 TTL（LLM 超时兜底）
+  estimate_unit_price: "0.000002"  # reserve 预估单价（每 token）
+  estimate_default_max_tokens: 1024
+  estimate_chars_per_token: 4
+  scheduled_interval: 10s          # 过期预留扫描间隔
+  resync_interval: 1h              # Redis-PG 缓存漂移校正
+  billing_interval: 0              # BillingRun 自动调度（0=仅手动触发）
+  recon_light_interval: 1h         # 小时轻量对账
+  recon_deep_interval: 24h         # 每日深度对账
