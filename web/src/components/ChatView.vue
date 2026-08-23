@@ -16,6 +16,23 @@ const listEl = ref(null)
 
 const messages = reactive([]) // { role:'user'|'assistant', content, reasoning?, usage? }
 
+// 聊天历史持久化：localStorage 保存最近 200 条，刷新/重开浏览器不丢
+const HISTORY_KEY = 'meteron_chat_history_v1'
+const HISTORY_CAP = 200
+
+function saveHistory() {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.slice(-HISTORY_CAP)))
+  } catch { /* 存储满等异常：静默放弃 */ }
+}
+
+function loadHistory() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]')
+    if (Array.isArray(saved) && saved.length) messages.push(...saved)
+  } catch { /* 损坏数据：当作无历史 */ }
+}
+
 const customerOptions = computed(() =>
   props.customers.map((c) => ({ value: c.external_id || c.id, label: c.name })))
 
@@ -33,6 +50,7 @@ const sessionStat = computed(() => {
 })
 
 onMounted(async () => {
+  loadHistory()
   try {
     models.value = await api('/api/v1/models')
     if (models.value.length && !model.value) model.value = models.value[0].model
@@ -61,6 +79,7 @@ async function send() {
   messages.push({ role: 'user', content: text })
   const reply = reactive({ role: 'assistant', content: '', reasoning: '', usage: null })
   messages.push(reply)
+  saveHistory()
   scrollBottom()
 
   // 携带历史上下文（与展示一致，最多截取最近 20 条防 body 膨胀）
@@ -125,12 +144,14 @@ async function send() {
     reply.content = '⚠ ' + e.message
   } finally {
     sending.value = false
+    saveHistory()
     scrollBottom()
   }
 }
 
 function clearChat() {
   messages.splice(0, messages.length)
+  saveHistory()
   errMsg.value = ''
 }
 </script>

@@ -59,7 +59,12 @@ const chart = computed(() => {
 
   const step = Math.ceil(d.length / 8)
   const xTicks = d
-    .map((x, i) => ({ i, x: padL + i * bw + bw / 2, label: dayBucket.value ? x.hour.slice(5) : x.hour.slice(5, 10) }))
+    .map((x, i) => ({
+      i,
+      x: padL + i * bw + bw / 2,
+      // 小时粒度带 "时" 区分同日各点；天粒度仅日期
+      label: dayBucket.value ? x.hour.slice(5) : x.hour.slice(5, 10) + ' ' + x.hour.slice(11, 13) + '时',
+    }))
     .filter((t) => t.i % step === 0)
 
   return { W, H, padL, padT, plotH, grid, bars, xTicks, axisY: padT + plotH, barW }
