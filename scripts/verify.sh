@@ -3,7 +3,7 @@
 #
 # 幂等：资源已存在则复用，可重复执行；用于部署后的全链路健康验证。
 #
-# 前置：docker compose up -d --build
+# 前置：docker compose -f deploy/docker-compose.yml up -d --build
 #
 # 流程：供给客户/产品/费率/合同/预算池 → Gateway 对话（mock provider）
 #       → 预算预留与确认 → Kafka→CH 计量 → 用量查询 → BillingRun → 账单定稿

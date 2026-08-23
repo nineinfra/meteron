@@ -16,8 +16,8 @@
 ## 快速开始（2 条命令）
 
 ```bash
-docker compose up -d --build   # 启动全栈 + Meteron（内置 mock provider，无需任何 API Key）
-./scripts/verify.sh            # 端到端验证：建客户→对话→计量→出账→定稿→对账
+docker compose -f deploy/docker-compose.yml up -d --build   # 启动全栈 + Meteron（内置 mock provider，无需任何 API Key）
+./scripts/verify.sh                                        # 端到端验证：建客户→对话→计量→出账→定稿→对账
 ```
 
 > 验证脚本仅依赖 `bash` + `curl`，幂等可重复执行。服务就绪约需 30~60 秒（首次拉镜像较慢）。
@@ -87,7 +87,7 @@ curl -s "localhost:8080/api/v1/usage?customer_id=<第1步返回的id>" \
 openssl rand -hex 32
 ```
 
-在部署环境注入并重启（容器部署全部走环境变量，见 docker-compose.yml）：
+在部署环境注入并重启（容器部署全部走环境变量，见 deploy/docker-compose.yml）：
 
 ```bash
 METERON_AES_KEY=<新key>                  # 加密上游 API Key，泄漏=上游账号被盗用
