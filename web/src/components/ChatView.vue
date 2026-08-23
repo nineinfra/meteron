@@ -93,6 +93,7 @@ async function send() {
     const reader = res.body.getReader()
     const dec = new TextDecoder()
     let buf = ''
+    let sawDone = false // 正常结束必有 data: [DONE]；缺失说明流被中途截断
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
@@ -103,7 +104,7 @@ async function send() {
         buf = buf.slice(nl + 1)
         if (!line.startsWith('data:')) continue
         const payload = line.slice(5).trim()
-        if (payload === '[DONE]') continue
+        if (payload === '[DONE]') { sawDone = true; continue }
         try {
           const j = JSON.parse(payload)
           const delta = j.choices?.[0]?.delta
@@ -114,7 +115,12 @@ async function send() {
         } catch { /* 忽略不完整/非 JSON 行 */ }
       }
     }
-    if (!reply.content && !reply.reasoning) reply.content = '（空响应）'
+    if (!sawDone && !reply.usage) {
+      // 流中断：正文/usage 未送达（如上游超时、连接断开）
+      reply.content = (reply.content || '') + '\n\n⚠ 连接中断，回复可能不完整'
+    } else if (!reply.content && !reply.reasoning) {
+      reply.content = '（空响应）'
+    }
   } catch (e) {
     reply.content = '⚠ ' + e.message
   } finally {

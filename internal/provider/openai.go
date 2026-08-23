@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 )
@@ -15,15 +16,29 @@ type OpenAICompatible struct {
 	name    string
 	baseURL string
 	apiKey  string
+	timeout time.Duration
 	client  *http.Client
 }
 
 func NewOpenAICompatible(name, baseURL, apiKey string, timeout time.Duration) *OpenAICompatible {
+	// 注意：timeout 不能设为 client.Timeout —— 它覆盖整个请求周期（含响应体
+	// 读取），SSE 流式响应会在该时刻被硬截断（本地思考模型推理可达数分钟）。
+	// 这里只约束"建连+模型加载+首字节"（ResponseHeaderTimeout），流式时长
+	// 由调用方 context 控制（客户端断开即取消上游请求）。
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+	}
 	return &OpenAICompatible{
 		name:    name,
 		baseURL: baseURL,
 		apiKey:  apiKey,
-		client:  &http.Client{Timeout: timeout},
+		timeout: timeout,
+		client:  &http.Client{Transport: transport},
 	}
 }
 
@@ -38,6 +53,12 @@ type openAIUsage struct {
 }
 
 func (a *OpenAICompatible) Chat(ctx context.Context, req *ChatRequest) (*ChatResult, error) {
+	if !req.Stream {
+		// 非流式：整体限时，防止上游挂起（流式不设整体上限，见构造函数注释）
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, a.timeout)
+		defer cancel()
+	}
 	body := req.Body
 	if req.Stream {
 		// 注入 stream_options.include_usage，确保流末尾返回 usage chunk

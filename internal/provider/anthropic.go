@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -17,15 +18,27 @@ type Anthropic struct {
 	name    string
 	baseURL string
 	apiKey  string
+	timeout time.Duration
 	client  *http.Client
 }
 
 func NewAnthropic(name, baseURL, apiKey string, timeout time.Duration) *Anthropic {
+	// timeout 仅约束到响应头就绪（同 OpenAICompatible：client.Timeout 会硬截断
+	// SSE 流式响应体，本地/长思考模型推理可远超该时长）。
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: timeout,
+	}
 	return &Anthropic{
 		name:    name,
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		apiKey:  apiKey,
-		client:  &http.Client{Timeout: timeout},
+		timeout: timeout,
+		client:  &http.Client{Transport: transport},
 	}
 }
 
@@ -72,6 +85,12 @@ type anthropicMsg struct {
 }
 
 func (a *Anthropic) Chat(ctx context.Context, req *ChatRequest) (*ChatResult, error) {
+	if !req.Stream {
+		// 非流式：整体限时，防止上游挂起（流式不设整体上限，见构造函数注释）
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, a.timeout)
+		defer cancel()
+	}
 	// OpenAI 请求 → Anthropic 请求
 	var openaiReq struct {
 		Model       string          `json:"model"`
