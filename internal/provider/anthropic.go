@@ -2,7 +2,6 @@ package provider
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -132,14 +131,11 @@ func (a *Anthropic) Chat(ctx context.Context, req *ChatRequest) (*ChatResult, er
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", a.apiKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := a.client.Do(httpReq)
+	// 网络错误 / 5xx 自动重试（瞬时故障）
+	resp, err := postJSONWithRetry(ctx, a.client, a.baseURL+"/v1/messages", body, func(h http.Header) {
+		h.Set("x-api-key", a.apiKey)
+		h.Set("anthropic-version", "2023-06-01")
+	})
 	if err != nil {
 		return nil, err
 	}

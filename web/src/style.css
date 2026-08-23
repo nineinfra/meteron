@@ -205,6 +205,25 @@ td.num, th.num { text-align: right; }
   border: 1px solid var(--border); background: var(--panel-2);
 }
 .chat-msg.user .bubble { background: rgba(79, 140, 255, .16); border-color: rgba(79, 140, 255, .35); }
+/* 复制按钮：默认半透明隐藏，hover 气泡时显现 */
+.chat-msg .bubble { position: relative; }
+.copy-btn {
+  position: absolute; top: 4px; right: 6px; z-index: 1;
+  border: none; background: transparent; color: var(--muted);
+  font-size: 11px; padding: 2px 6px; border-radius: 6px;
+  opacity: 0; transition: opacity .15s; cursor: pointer;
+}
+.chat-msg:hover .copy-btn, .copy-btn:focus-visible, .copy-btn.ok { opacity: 1; }
+.copy-btn:hover { color: var(--text); background: rgba(127, 127, 127, .15); }
+.copy-btn.ok { color: var(--green, #3ecf8e); }
+/* 停止按钮：等待响应气泡内 */
+.stop-btn {
+  margin-left: 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: var(--muted); font-size: 11px;
+  padding: 1px 8px; cursor: pointer;
+}
+.stop-btn:hover { color: var(--red); border-color: var(--red); }
+.btn.stop-wide { color: var(--red); }
 .chat-text { white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 13px; }
 .chat-usage {
   display: flex; gap: 10px; margin-top: 6px; padding-top: 6px;

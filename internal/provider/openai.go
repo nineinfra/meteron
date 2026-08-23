@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -79,15 +78,12 @@ func (a *OpenAICompatible) Chat(ctx context.Context, req *ChatRequest) (*ChatRes
 		body = nb
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if a.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+a.apiKey)
-	}
-	resp, err := a.client.Do(httpReq)
+	// 网络错误 / 5xx 自动重试（本地 Ollama 排队超时、推理中断等瞬时故障）
+	resp, err := postJSONWithRetry(ctx, a.client, a.baseURL+"/chat/completions", body, func(h http.Header) {
+		if a.apiKey != "" {
+			h.Set("Authorization", "Bearer "+a.apiKey)
+		}
+	})
 	if err != nil {
 		return nil, err
 	}

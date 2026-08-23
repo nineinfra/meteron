@@ -14,6 +14,47 @@ const sending = ref(false)
 const errMsg = ref('')
 const listEl = ref(null)
 
+// 等待计时（本地大模型首 token 可达数十秒，给用户"未卡死"的反馈）
+const waitingSec = ref(0)
+let waitTimer = null
+let abortCtl = null // 停止按钮：中断当前请求（联动取消上游推理）
+
+function startWait() {
+  waitingSec.value = 0
+  waitTimer = setInterval(() => { waitingSec.value++ }, 1000)
+}
+function stopWait() {
+  if (waitTimer) { clearInterval(waitTimer); waitTimer = null }
+  waitingSec.value = 0
+}
+
+// 停止当前生成：fetch abort → 网关感知断开 → 取消上游请求（释放 Ollama 排队槽）
+function stop() {
+  if (abortCtl) abortCtl.abort()
+}
+
+// 复制消息内容（clipboard API 失败时回退 execCommand，兼容非安全上下文/LAN 访问）
+async function copyMsg(m) {
+  const text = m.content || ''
+  if (!text) return
+  let ok = false
+  try { await navigator.clipboard.writeText(text); ok = true } catch {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.cssText = 'position:fixed;opacity:0'
+      document.body.appendChild(ta)
+      ta.select()
+      ok = document.execCommand('copy')
+      ta.remove()
+    } catch { ok = false }
+  }
+  if (ok) {
+    m._copied = true
+    setTimeout(() => { m._copied = false }, 1500)
+  }
+}
+
 const messages = reactive([]) // { role:'user'|'assistant', content, reasoning?, usage? }
 
 // 聊天历史持久化：localStorage 保存最近 200 条，刷新/重开浏览器不丢
@@ -87,9 +128,12 @@ async function send() {
     .map((m) => ({ role: m.role, content: m.content }))
 
   sending.value = true
+  startWait()
+  abortCtl = new AbortController()
   try {
     const res = await fetch('/v1/chat/completions', {
       method: 'POST',
+      signal: abortCtl.signal,
       headers: {
         Authorization: 'Bearer ' + session.key,
         'Content-Type': 'application/json',
@@ -128,8 +172,8 @@ async function send() {
           const j = JSON.parse(payload)
           const delta = j.choices?.[0]?.delta
           // 思考模型（qwen3 等）先输出 reasoning 再输出 content，两者都要渲染
-          if (delta?.reasoning) { reply.reasoning = (reply.reasoning || '') + delta.reasoning; scrollBottom() }
-          if (delta?.content) { reply.content += delta.content; scrollBottom() }
+          if (delta?.reasoning) { reply.reasoning = (reply.reasoning || '') + delta.reasoning; stopWait(); scrollBottom() }
+          if (delta?.content) { reply.content += delta.content; stopWait(); scrollBottom() }
           if (j.usage) reply.usage = j.usage
         } catch { /* 忽略不完整/非 JSON 行 */ }
       }
@@ -141,9 +185,15 @@ async function send() {
       reply.content = '（空响应）'
     }
   } catch (e) {
-    reply.content = '⚠ ' + e.message
+    if (e.name === 'AbortError') {
+      reply.content = (reply.content ? reply.content + '\n\n' : '') + '⏹ 已停止'
+    } else {
+      reply.content = '⚠ ' + e.message
+    }
   } finally {
+    stopWait()
     sending.value = false
+    abortCtl = null
     saveHistory()
     scrollBottom()
   }
@@ -189,6 +239,9 @@ function clearChat() {
       </div>
       <div v-for="(m, i) in messages" :key="i" class="chat-msg" :class="m.role">
         <div class="bubble">
+          <button v-if="m.content" class="copy-btn" :class="{ ok: m._copied }" @click="copyMsg(m)">
+            {{ m._copied ? '已复制' : '复制' }}
+          </button>
           <details v-if="m.reasoning" class="chat-reasoning" :open="sending && i === messages.length - 1 && !m.content">
             <summary>思考过程</summary>
             <pre class="chat-text reasoning-text">{{ m.reasoning }}</pre>
@@ -202,7 +255,10 @@ function clearChat() {
         </div>
       </div>
       <div v-if="sending && !(messages[messages.length - 1]?.content || messages[messages.length - 1]?.reasoning)" class="chat-msg assistant">
-        <div class="bubble"><span class="typing">等待响应…</span></div>
+        <div class="bubble">
+          <span class="typing">等待响应… {{ waitingSec }}s</span>
+          <button class="stop-btn" @click="stop">停止</button>
+        </div>
       </div>
     </div>
 
@@ -212,6 +268,7 @@ function clearChat() {
     <div class="chat-input">
       <textarea v-model="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"
         :disabled="sending" @keydown.enter.exact.prevent="send"></textarea>
+      <button v-if="sending" class="btn stop-wide" @click="stop">停止</button>
       <button class="btn primary" @click="send" :disabled="sending || !input.trim()">发送</button>
     </div>
   </div>
