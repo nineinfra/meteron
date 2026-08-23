@@ -16,6 +16,9 @@ web/node_modules/
 debug.log
 *.lnk
 
+# docker compose 数据目录（bind mount）
+deploy/data/
+
 # IDE
 .idea/
 .vscode/

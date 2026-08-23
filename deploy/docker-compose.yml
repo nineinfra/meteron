@@ -2,6 +2,8 @@
 # 启动（项目根执行）：docker compose -f deploy/docker-compose.yml up -d --build
 #   或：cd deploy && docker compose up -d --build
 # 全链路验证：./scripts/verify.sh
+# 数据目录：bind mount 到本目录 ./data/（postgres / clickhouse / kafka），
+#           卸载重装数据仍在；重置环境删除 ./data 即可
 name: meteron
 services:
   postgres:
@@ -13,7 +15,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U meteron -d meteron"]
       interval: 5s
@@ -31,7 +33,7 @@ services:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - chdata:/var/lib/clickhouse
+      - ./data/clickhouse:/var/lib/clickhouse
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --user meteron --password meteron123 --query 'SELECT 1'"]
       interval: 5s
@@ -63,7 +65,7 @@ services:
     ports:
       - "9092:9092"
     volumes:
-      - kafkadata:/bitnami/kafka
+      - ./data/kafka:/bitnami/kafka
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
@@ -94,8 +96,3 @@ services:
       METERON_BOOTSTRAP_API_KEY: "mk_meteron_bootstrap_dev_key"
     ports:
       - "8080:8080"
-
-volumes:
-  pgdata:
-  chdata:
-  kafkadata:
