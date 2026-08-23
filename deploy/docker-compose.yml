@@ -2,8 +2,10 @@
 # 启动（项目根执行）：docker compose -f deploy/docker-compose.yml up -d --build
 #   或：cd deploy && docker compose up -d --build
 # 全链路验证：./scripts/verify.sh
-# 数据目录：bind mount 到本目录 ./data/（postgres / clickhouse / kafka），
-#           卸载重装数据仍在；重置环境删除 ./data 即可
+# 数据目录：postgres / kafka 为 bind mount（./data/，卸载重装数据仍在）。
+# 注意：clickhouse 必须用命名卷——MergeTree 写入依赖目录 rename，
+# Windows/macOS bind mount 上会 Permission denied（官方已知限制），
+# 数据实际存放于 Docker 卷 meteron_chdata。重置环境：docker volume rm meteron_chdata
 name: meteron
 services:
   postgres:
@@ -33,7 +35,7 @@ services:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - ./data/clickhouse:/var/lib/clickhouse
+      - chdata:/var/lib/clickhouse
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --user meteron --password meteron123 --query 'SELECT 1'"]
       interval: 5s
@@ -76,6 +78,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    # 容器内访问宿主机 Ollama（host.docker.internal，Linux 宿主机需此映射）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,3 +101,6 @@ services:
       METERON_BOOTSTRAP_API_KEY: "mk_meteron_bootstrap_dev_key"
     ports:
       - "8080:8080"
+
+volumes:
+  chdata:

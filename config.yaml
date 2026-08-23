@@ -18,16 +18,16 @@ aes_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 bootstrap_api_key: "mk_meteron_bootstrap_dev_key"
 
 providers:
+  # 默认模型：本地 Ollama 的 qwen3.5:9b（先 ollama pull qwen3.5:9b）
+  - name: ollama
+    type: local
+    base_url: "http://localhost:11434/v1"
+    models: ["qwen3.5:9b"]
   - name: mock
     type: mock
     models:
       - mock-chat
       - mock-cheap
-  # 本地部署模型（Ollama / vLLM / LM Studio / llama.cpp-server 等 OpenAI 兼容端点，api_key 可留空）
-  # - name: ollama
-  #   type: local
-  #   base_url: "http://localhost:11434/v1"
-  #   models: ["llama3.1", "qwen2.5:7b"]
   # - name: vllm
   #   type: local
   #   base_url: "http://localhost:8000/v1"

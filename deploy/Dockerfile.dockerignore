@@ -4,3 +4,4 @@ scripts/
 config.yaml
 web/node_modules
 internal/ui/dist
+deploy/data

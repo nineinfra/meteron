@@ -70,6 +70,10 @@ func Default() *Config {
 	c.Business.ReconLightInterval = time.Hour
 	c.Business.ReconDeepInterval = 24 * time.Hour
 	c.Providers = []ProviderConfig{
+		// 默认模型：本机 Ollama 的 qwen3.5:9b（OpenAI 兼容端点，api_key 留空）。
+		// 容器内经 host.docker.internal 访问宿主机 Ollama；宿主机直跑时由 config.yaml 覆盖为 localhost。
+		{Name: "ollama", Type: "local", BaseURL: "http://host.docker.internal:11434/v1", Models: []string{"qwen3.5:9b"}},
+		// mock：无外部依赖的验证用 provider（verify.sh 使用）
 		{Name: "mock", Type: "mock", BaseURL: "", APIKey: "", Models: []string{"mock-chat", "mock-cheap"}},
 	}
 	return c

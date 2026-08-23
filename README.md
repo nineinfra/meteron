@@ -46,12 +46,12 @@ curl -sX POST localhost:8080/api/v1/customers \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme","external_id":"acme","currency":"USD"}'
 
-# 2. 发起对话（OpenAI 兼容，X-Meteron-Customer-ID 支持 UUID 或 external_id）
+# 2. 发起对话（默认模型为本机 Ollama 的 qwen3.5:9b；X-Meteron-Customer-ID 支持 UUID 或 external_id）
 curl -sX POST localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer mk_meteron_bootstrap_dev_key" \
   -H "X-Meteron-Customer-ID: acme" \
   -H "Content-Type: application/json" \
-  -d '{"model":"mock-chat","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"hello"}]}'
 
 # 3. 查用量（异步链路 Kafka→ClickHouse，约 5 秒后可查；customer_id 需用第 1 步返回的 UUID）
 curl -s "localhost:8080/api/v1/usage?customer_id=<第1步返回的id>" \
