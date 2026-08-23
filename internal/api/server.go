@@ -61,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// customers
+	mux.HandleFunc("GET /api/v1/models", s.listModels)
 	mux.HandleFunc("GET /api/v1/customers", s.listCustomers)
 	mux.HandleFunc("POST /api/v1/customers", s.createCustomer)
 	mux.HandleFunc("GET /api/v1/customers/{id}", s.getCustomer)

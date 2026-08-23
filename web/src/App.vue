@@ -2,6 +2,7 @@
 import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
 import { session, persistSession, clearSession, api, UnauthorizedError, fmtAmount, fmtPeriod, fmtTime } from './api.js'
 import UsageChart from './components/UsageChart.vue'
+import ChatPanel from './components/ChatPanel.vue'
 
 const connected = ref(false)
 const connStatus = ref('')
@@ -190,6 +191,9 @@ onUnmounted(() => { if (timer.value) clearInterval(timer.value) })
         <span class="spacer"></span>
         <span class="updated muted">{{ updated }}</span>
       </section>
+
+      <!-- 模型对话 -->
+      <ChatPanel :customers="state.customers" />
 
       <!-- KPI -->
       <section class="kpis">
