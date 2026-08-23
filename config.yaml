@@ -3,8 +3,8 @@
 # Docker 部署见 deploy/docker-compose.yml（全部通过环境变量注入）
 
 server:
-  addr: ":8080"         # API/网关端点（/v1 /api/v1 /metrics）
-  console_addr: ":9080" # Web 控制台端点（UI + 反代 API，置空禁用）
+  addr: ":9080"         # API/网关端点（/v1 /api/v1 /metrics）
+  console_addr: ":8080" # Web 控制台端点（UI + 反代 API，置空禁用）
 
 pg_dsn: "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
 clickhouse_dsn: "clickhouse://meteron:meteron123@localhost:9000/meteron"

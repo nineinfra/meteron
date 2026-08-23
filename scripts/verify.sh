@@ -9,7 +9,7 @@
 #       → 预算预留与确认 → Kafka→CH 计量 → 用量查询 → BillingRun → 账单定稿
 set -euo pipefail
 
-BASE="${METERON_BASE:-http://localhost:8080}"
+BASE="${METERON_BASE:-http://localhost:9080}"
 KEY="${METERON_KEY:-mk_meteron_bootstrap_dev_key}"
 AUTH="Authorization: Bearer ${KEY}"
 

@@ -36,8 +36,8 @@ type Business struct {
 
 type Config struct {
 	Server struct {
-		Addr        string `yaml:"addr"`         // API/网关端点 ":8080"（/v1 /api/v1 /metrics）
-		ConsoleAddr string `yaml:"console_addr"` // Web 控制台端点 ":9080"（静态 UI + 反代 API）
+		Addr        string `yaml:"addr"`         // API/网关端点 ":9080"（/v1 /api/v1 /metrics）
+		ConsoleAddr string `yaml:"console_addr"` // Web 控制台端点 ":8080"（静态 UI + 反代 API）
 	} `yaml:"server"`
 	PGDSN         string           `yaml:"pg_dsn"`
 	ClickHouseDSN string           `yaml:"clickhouse_dsn"`
@@ -52,8 +52,8 @@ type Config struct {
 
 func Default() *Config {
 	c := &Config{}
-	c.Server.Addr = ":8080"
-	c.Server.ConsoleAddr = ":9080"
+	c.Server.Addr = ":9080"
+	c.Server.ConsoleAddr = ":8080"
 	c.PGDSN = "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
 	c.ClickHouseDSN = "clickhouse://meteron:meteron123@localhost:9000/meteron"
 	c.KafkaBrokers = []string{"localhost:9092"}

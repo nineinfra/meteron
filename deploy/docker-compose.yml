@@ -91,8 +91,8 @@ services:
       kafka:
         condition: service_healthy
     environment:
-      METERON_SERVER_ADDR: ":8080"      # API/网关端点
-      METERON_CONSOLE_ADDR: ":9080"     # Web 控制台端点（UI + 反代 API）
+      METERON_SERVER_ADDR: ":9080"      # API/网关端点
+      METERON_CONSOLE_ADDR: ":8080"     # Web 控制台端点（UI + 反代 API）
       METERON_PG_DSN: "host=postgres port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
       METERON_CLICKHOUSE_DSN: "clickhouse://meteron:meteron123@clickhouse:9000/meteron"
       METERON_KAFKA_BROKERS: "kafka:9092"
@@ -101,8 +101,8 @@ services:
       METERON_AES_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
       METERON_BOOTSTRAP_API_KEY: "mk_meteron_bootstrap_dev_key"
     ports:
-      - "8080:8080"   # API 端点：/v1/chat/completions、/api/v1/*、/metrics
-      - "9080:9080"   # 控制台端点：Web UI（浏览器访问）
+      - "8080:8080"   # Web 控制台端点：浏览器访问的 UI
+      - "9080:9080"   # API 端点：/v1/chat/completions、/api/v1/*、/metrics
 
 volumes:
   chdata:

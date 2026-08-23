@@ -28,10 +28,10 @@ API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对�
 
 | 端点 | 端口 | 内容 |
 |---|---|---|
-| API/网关 | `:8080` | `/v1/chat/completions`、`/api/v1/*`、`/metrics`、`/healthz` |
-| Web 控制台 | `:9080` | 浏览器访问的 UI（内置反向代理调用 API，同源无 CORS） |
+| Web 控制台 | `:8080` | 浏览器访问的 UI（内置反向代理调用 API，同源无 CORS） |
+| API/网关 | `:9080` | `/v1/chat/completions`、`/api/v1/*`、`/metrics`、`/healthz` |
 
-启动后浏览器打开 **`http://localhost:9080/`**，输入 API Key（开发环境默认
+启动后浏览器打开 **`http://localhost:8080/`**，输入 API Key（开发环境默认
 `mk_meteron_bootstrap_dev_key`），左侧菜单两个界面：
 
 - **监控看板**：KPI 卡片（请求数、输入/输出/缓存 tokens，24h/7d/30d 切换）、用量趋势图、
@@ -47,20 +47,20 @@ API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对�
 
 ```bash
 # 1. 建客户（拿到 customer_id）
-curl -sX POST localhost:8080/api/v1/customers \
+curl -sX POST localhost:9080/api/v1/customers \
   -H "Authorization: Bearer mk_meteron_bootstrap_dev_key" \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme","external_id":"acme","currency":"USD"}'
 
 # 2. 发起对话（默认模型为本机 Ollama 的 qwen3.5:9b；X-Meteron-Customer-ID 支持 UUID 或 external_id）
-curl -sX POST localhost:8080/v1/chat/completions \
+curl -sX POST localhost:9080/v1/chat/completions \
   -H "Authorization: Bearer mk_meteron_bootstrap_dev_key" \
   -H "X-Meteron-Customer-ID: acme" \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"hello"}]}'
 
 # 3. 查用量（异步链路 Kafka→ClickHouse，约 5 秒后可查；customer_id 需用第 1 步返回的 UUID）
-curl -s "localhost:8080/api/v1/usage?customer_id=<第1步返回的id>" \
+curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
   -H "Authorization: Bearer mk_meteron_bootstrap_dev_key"
 ```
 
@@ -143,11 +143,11 @@ providers:
 
 ```bash
 # 发起一次真实对话，然后：
-curl -s "localhost:8080/api/v1/usage?customer_id=<UUID>" -H "$AUTH"          # 用量已累计
-curl -s "localhost:8080/api/v1/budget-pools/<POOL_ID>/balance" -H "$AUTH"    # 预算已扣减
-curl -sX POST localhost:8080/api/v1/billing-runs -H "$AUTH" \
+curl -s "localhost:9080/api/v1/usage?customer_id=<UUID>" -H "$AUTH"          # 用量已累计
+curl -s "localhost:9080/api/v1/budget-pools/<POOL_ID>/balance" -H "$AUTH"    # 预算已扣减
+curl -sX POST localhost:9080/api/v1/billing-runs -H "$AUTH" \
   -d '{"period_start":"2026-08-23T00:00:00Z","period_end":"2026-08-24T00:00:00Z"}'  # 出账
-curl -sX POST localhost:8080/api/v1/bills/<BILL_ID>/finalize -H "$AUTH"      # 定稿（不可再改）
+curl -sX POST localhost:9080/api/v1/bills/<BILL_ID>/finalize -H "$AUTH"      # 定稿（不可再改）
 ```
 
 ### 5. 开启自动化调度
