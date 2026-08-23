@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -12,6 +13,82 @@ import (
 )
 
 // ---- budget pools ----
+
+// listBudgetPools 列出预算池及其实时余额（前端看板批量加载，单条聚合 SQL）。
+func (s *Server) listBudgetPools(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	customerID, err := customerFilter(r, ident)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	args := []interface{}{ident.TenantID.String()}
+	query := `
+SELECT p.id::text, p.customer_id::text, p.task_type, p.agent_id,
+       p.max_budget::text, p.warning_threshold::text, p.exhaust_policy,
+       COALESCE(sp.spent, 0)::text, COALESCE(pd.pend, 0)::text
+FROM budget_pools p
+LEFT JOIN (
+  SELECT pool_id, SUM(actual_amount) AS spent
+  FROM budget_reservations WHERE status='confirmed' GROUP BY pool_id
+) sp ON sp.pool_id = p.id
+LEFT JOIN (
+  SELECT pool_id, SUM(reserved_amount) AS pend
+  FROM budget_reservations WHERE status='pending' GROUP BY pool_id
+) pd ON pd.pool_id = p.id
+WHERE p.tenant_id=$1::uuid AND p.deleted_at IS NULL`
+	if customerID != nil {
+		query += ` AND p.customer_id=$2::uuid`
+		args = append(args, customerID.String())
+	}
+	query += ` ORDER BY p.created_at DESC LIMIT 100`
+
+	rows, err := s.db.Query(r.Context(), query, args...)
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type poolView struct {
+		ID               string  `json:"id"`
+		CustomerID       string  `json:"customer_id"`
+		TaskType         *string `json:"task_type"`
+		AgentID          *string `json:"agent_id"`
+		MaxBudget        string  `json:"max_budget"`
+		WarningThreshold *string `json:"warning_threshold"`
+		ExhaustPolicy    string  `json:"exhaust_policy"`
+		SpentAmount      string  `json:"spent_amount"`
+		PendingReserved  string  `json:"pending_reserved"`
+		AvailableAmount  string  `json:"available_amount"`
+	}
+	out := []poolView{}
+	for rows.Next() {
+		var v poolView
+		if err := rows.Scan(&v.ID, &v.CustomerID, &v.TaskType, &v.AgentID,
+			&v.MaxBudget, &v.WarningThreshold, &v.ExhaustPolicy,
+			&v.SpentAmount, &v.PendingReserved); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		max, err1 := decimal.NewFromString(v.MaxBudget)
+		spent, err2 := decimal.NewFromString(v.SpentAmount)
+		pend, err3 := decimal.NewFromString(v.PendingReserved)
+		if err1 != nil || err2 != nil || err3 != nil {
+			writeErr(w, common.ErrInternal.Wrap(errors.New("bad decimal from db")))
+			return
+		}
+		v.AvailableAmount = max.Sub(spent).Sub(pend).String()
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	writeOK(w, out)
+}
 
 func (s *Server) createBudgetPool(w http.ResponseWriter, r *http.Request) {
 	ident := requireScope(w, r, rbac.ScopeAdmin)

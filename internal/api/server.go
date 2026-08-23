@@ -68,13 +68,19 @@ func (s *Server) Handler() http.Handler {
 
 	// 计量计价供给链（products / rate-cards / rules / contracts）
 	mux.HandleFunc("POST /api/v1/billable-metrics", s.createBillableMetric)
+	mux.HandleFunc("GET /api/v1/billable-metrics", s.listBillableMetrics)
 	mux.HandleFunc("POST /api/v1/products", s.createProduct)
+	mux.HandleFunc("GET /api/v1/products", s.listProducts)
 	mux.HandleFunc("POST /api/v1/rate-cards", s.createRateCard)
+	mux.HandleFunc("GET /api/v1/rate-cards", s.listRateCards)
 	mux.HandleFunc("POST /api/v1/rate-cards/{id}/rules", s.createRateRule)
+	mux.HandleFunc("GET /api/v1/rate-cards/{id}/rules", s.listRateRules)
 	mux.HandleFunc("POST /api/v1/contracts", s.createContract)
+	mux.HandleFunc("GET /api/v1/contracts", s.listContracts)
 
 	// 预算
 	mux.HandleFunc("POST /api/v1/budget-pools", s.createBudgetPool)
+	mux.HandleFunc("GET /api/v1/budget-pools", s.listBudgetPools)
 	mux.HandleFunc("GET /api/v1/budget-pools/{id}/balance", s.poolBalance)
 	mux.HandleFunc("POST /api/v1/budget-reservations/{id}/confirm", s.confirmReservation)
 	mux.HandleFunc("POST /api/v1/budget-reservations/{id}/release", s.releaseReservation)
@@ -150,16 +156,20 @@ func pathID(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, boo
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxAPIBody))
-	if err != nil {
-		writeErr(w, common.ErrBadRequest.Wrap(err))
-		return false
-	}
-	if err := json.Unmarshal(body, v); err != nil {
+	if !decodeBodySilent(r, v) {
 		writeErr(w, common.ErrBadRequest.Wrap(errors.New("invalid json body")))
 		return false
 	}
 	return true
+}
+
+// decodeBodySilent 解析 body 但不写响应（body 可选的端点使用，空/非法 body 静默忽略）。
+func decodeBodySilent(r *http.Request, v interface{}) bool {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxAPIBody))
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(body, v) == nil
 }
 
 func writeErr(w http.ResponseWriter, err error) {

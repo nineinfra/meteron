@@ -23,6 +23,15 @@ providers:
     models:
       - mock-chat
       - mock-cheap
+  # 本地部署模型（Ollama / vLLM / LM Studio / llama.cpp-server 等 OpenAI 兼容端点，api_key 可留空）
+  # - name: ollama
+  #   type: local
+  #   base_url: "http://localhost:11434/v1"
+  #   models: ["llama3.1", "qwen2.5:7b"]
+  # - name: vllm
+  #   type: local
+  #   base_url: "http://localhost:8000/v1"
+  #   models: ["qwen2.5-72b"]
   # - name: openai-main
   #   type: openai
   #   base_url: "https://api.openai.com/v1"

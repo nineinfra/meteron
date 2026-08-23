@@ -26,6 +26,7 @@ import (
 	"github.com/meteron/meteron/internal/rbac"
 	"github.com/meteron/meteron/internal/router"
 	"github.com/meteron/meteron/internal/store"
+	"github.com/meteron/meteron/internal/ui"
 	"github.com/meteron/meteron/internal/worker"
 )
 
@@ -121,6 +122,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Web 控制台（内嵌静态资源，精确路径优先级高于 "/"）
+	mux.Handle("/", ui.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,

@@ -62,7 +62,7 @@ func (s *Server) finalizeBill(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason string `json:"reason"`
 	}
-	_ = decodeBody(w, r, &req) // body 可选
+	_ = decodeBodySilent(r, &req) // body 可选：空/非法 body 静默忽略
 
 	b, err := billing.FinalizeBill(r.Context(), s.db, ident.TenantID, billID)
 	if err != nil {

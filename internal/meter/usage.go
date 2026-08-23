@@ -2,6 +2,7 @@ package meter
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -43,64 +44,210 @@ type EventRow struct {
 	Metadata    map[string]string
 }
 
-// QueryUsage 用量汇总（报表优先使用 hourly 预聚合表，规避 FINAL 开销）。
+// hourlySafeBoundary 返回保证已落盘 meter_events_hourly 的最大小时（含该小时）。
+// MeterWorker 在小时关闭 +2min 宽限期后落盘（30s tick），再加 1min 余量：
+// (now - 1h - 3min) 所在小时之前的聚合必定可见。
+func hourlySafeBoundary(now time.Time) time.Time {
+	return now.Add(-time.Hour - 3*time.Minute).UTC().Truncate(time.Hour)
+}
+
+// mergeUsageAdd 将一段查询结果累加进 merged（key: task|model|provider）。
+func mergeUsageAdd(merged map[string]*UsageSummary, s UsageSummary) {
+	k := s.TaskType + "|" + s.Model + "|" + s.Provider
+	if m, ok := merged[k]; ok {
+		m.InputTokens += s.InputTokens
+		m.OutputTokens += s.OutputTokens
+		m.CachedTokens += s.CachedTokens
+		m.RequestCount += s.RequestCount
+		return
+	}
+	cp := s
+	merged[k] = &cp
+}
+
+// QueryUsage 用量汇总：已关闭小时走 hourly 预聚合表，未关闭小时（最近约 1h）
+// 从明细表 FINAL 实时聚合（SinkWorker 200ms 批次写入），保证前端近实时可见。
 func QueryUsage(ctx context.Context, ch driver.Conn, tenantID uuid.UUID, customerID *uuid.UUID, from, to time.Time) ([]UsageSummary, error) {
-	sql := `
+	// openFrom：未关闭区间起点（hourly 安全边界 + 1h）
+	openFrom := hourlySafeBoundary(time.Now().UTC()).Add(time.Hour)
+	merged := map[string]*UsageSummary{}
+
+	// 1) 已关闭小时：hourly 预聚合表（规避 FINAL 开销）
+	hourlyTo := to
+	if openFrom.Before(hourlyTo) {
+		hourlyTo = openFrom
+	}
+	if from.Before(hourlyTo) {
+		sql := `
 SELECT task_type, model, provider,
        SUM(total_input_tokens), SUM(total_output_tokens), SUM(total_cached_input_tokens), SUM(request_count)
 FROM meter_events_hourly
 WHERE tenant_id = toUUID($1) AND hour >= $2 AND hour < $3`
-	args := []interface{}{tenantID.String(), from, to}
-	if customerID != nil {
-		sql += ` AND customer_id = toUUID($4)`
-		args = append(args, customerID.String())
-	}
-	sql += ` GROUP BY task_type, model, provider ORDER BY request_count DESC`
-
-	rows, err := ch.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []UsageSummary
-	for rows.Next() {
-		var s UsageSummary
-		if err := rows.Scan(&s.TaskType, &s.Model, &s.Provider,
-			&s.InputTokens, &s.OutputTokens, &s.CachedTokens, &s.RequestCount); err != nil {
+		args := []interface{}{tenantID.String(), from, hourlyTo}
+		if customerID != nil {
+			sql += ` AND customer_id = toUUID($4)`
+			args = append(args, customerID.String())
+		}
+		sql += ` GROUP BY task_type, model, provider`
+		rows, err := ch.Query(ctx, sql, args...)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, s)
+		for rows.Next() {
+			var s UsageSummary
+			if err := rows.Scan(&s.TaskType, &s.Model, &s.Provider,
+				&s.InputTokens, &s.OutputTokens, &s.CachedTokens, &s.RequestCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			mergeUsageAdd(merged, s)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+
+	// 2) 未关闭小时：明细表 FINAL 实时聚合
+	detailFrom := from
+	if openFrom.After(detailFrom) {
+		detailFrom = openFrom
+	}
+	if detailFrom.Before(to) {
+		sql := `
+SELECT task_type, model, provider,
+       SUM(input_tokens), SUM(output_tokens), SUM(cached_input_tokens), count()
+FROM meter_events FINAL
+WHERE tenant_id = toUUID($1) AND event_time >= $2 AND event_time < $3`
+		args := []interface{}{tenantID.String(), detailFrom, to}
+		if customerID != nil {
+			sql += ` AND customer_id = toUUID($4)`
+			args = append(args, customerID.String())
+		}
+		sql += ` GROUP BY task_type, model, provider`
+		rows, err := ch.Query(ctx, sql, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var s UsageSummary
+			if err := rows.Scan(&s.TaskType, &s.Model, &s.Provider,
+				&s.InputTokens, &s.OutputTokens, &s.CachedTokens, &s.RequestCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			mergeUsageAdd(merged, s)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	out := make([]UsageSummary, 0, len(merged))
+	for _, s := range merged {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RequestCount > out[j].RequestCount })
+	return out, nil
 }
 
-// QueryTimeseries 小时粒度时序。
+// QueryTimeseries 小时粒度时序：已关闭小时走 hourly 表，未关闭小时从明细表聚合，
+// 两段按小时合并（前端近实时曲线）。
 func QueryTimeseries(ctx context.Context, ch driver.Conn, tenantID uuid.UUID, customerID *uuid.UUID, from, to time.Time) ([]TimeseriesPoint, error) {
-	sql := `
+	openFrom := hourlySafeBoundary(time.Now().UTC()).Add(time.Hour)
+	merged := map[time.Time]*TimeseriesPoint{}
+
+	// 1) 已关闭小时：hourly 预聚合表
+	hourlyTo := to
+	if openFrom.Before(hourlyTo) {
+		hourlyTo = openFrom
+	}
+	if from.Before(hourlyTo) {
+		sql := `
 SELECT hour, SUM(total_input_tokens), SUM(total_output_tokens), SUM(request_count)
 FROM meter_events_hourly
 WHERE tenant_id = toUUID($1) AND hour >= $2 AND hour < $3`
-	args := []interface{}{tenantID.String(), from, to}
-	if customerID != nil {
-		sql += ` AND customer_id = toUUID($4)`
-		args = append(args, customerID.String())
-	}
-	sql += ` GROUP BY hour ORDER BY hour`
-
-	rows, err := ch.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []TimeseriesPoint
-	for rows.Next() {
-		var p TimeseriesPoint
-		if err := rows.Scan(&p.Hour, &p.InputTokens, &p.OutputTokens, &p.RequestCount); err != nil {
+		args := []interface{}{tenantID.String(), from, hourlyTo}
+		if customerID != nil {
+			sql += ` AND customer_id = toUUID($4)`
+			args = append(args, customerID.String())
+		}
+		sql += ` GROUP BY hour`
+		rows, err := ch.Query(ctx, sql, args...)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, p)
+		for rows.Next() {
+			var p TimeseriesPoint
+			if err := rows.Scan(&p.Hour, &p.InputTokens, &p.OutputTokens, &p.RequestCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			cp := p
+			merged[p.Hour] = &cp
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return out, rows.Err()
+
+	// 2) 未关闭小时：明细表按 toStartOfHour 聚合
+	detailFrom := from
+	if openFrom.After(detailFrom) {
+		detailFrom = openFrom
+	}
+	if detailFrom.Before(to) {
+		sql := `
+SELECT toStartOfHour(event_time), SUM(input_tokens), SUM(output_tokens), count()
+FROM meter_events FINAL
+WHERE tenant_id = toUUID($1) AND event_time >= $2 AND event_time < $3`
+		args := []interface{}{tenantID.String(), detailFrom, to}
+		if customerID != nil {
+			sql += ` AND customer_id = toUUID($4)`
+			args = append(args, customerID.String())
+		}
+		sql += ` GROUP BY 1`
+		rows, err := ch.Query(ctx, sql, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p TimeseriesPoint
+			if err := rows.Scan(&p.Hour, &p.InputTokens, &p.OutputTokens, &p.RequestCount); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if m, ok := merged[p.Hour]; ok {
+				m.InputTokens += p.InputTokens
+				m.OutputTokens += p.OutputTokens
+				m.RequestCount += p.RequestCount
+			} else {
+				cp := p
+				merged[p.Hour] = &cp
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	hours := make([]time.Time, 0, len(merged))
+	for h := range merged {
+		hours = append(hours, h)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].Before(hours[j]) })
+	out := make([]TimeseriesPoint, 0, len(hours))
+	for _, h := range hours {
+		out = append(out, *merged[h])
+	}
+	return out, nil
 }
 
 // QueryEvents 查询计量明细（FINAL 必带）。

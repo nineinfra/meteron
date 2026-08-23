@@ -165,6 +165,110 @@ func (s *Server) updateCustomer(w http.ResponseWriter, r *http.Request) {
 
 // ---- 计量计价供给链 ----
 
+// listBillableMetrics 列出计量指标（供给链幂等查询用）。
+func (s *Server) listBillableMetrics(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text, name, aggregation_type::text, group_keys, created_at
+FROM billable_metrics WHERE tenant_id=$1::uuid AND deleted_at IS NULL
+ORDER BY created_at DESC LIMIT 100`, ident.TenantID.String())
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type view struct {
+		ID              string    `json:"id"`
+		Name            string    `json:"name"`
+		AggregationType string    `json:"aggregation_type"`
+		GroupKeys       []string  `json:"group_keys"`
+		CreatedAt       time.Time `json:"created_at"`
+	}
+	out := []view{}
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.ID, &v.Name, &v.AggregationType, &v.GroupKeys, &v.CreatedAt); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		out = append(out, v)
+	}
+	writeOK(w, out)
+}
+
+// listProducts 列出产品。
+func (s *Server) listProducts(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text, metric_id::text, name, display_name, created_at
+FROM products WHERE tenant_id=$1::uuid AND deleted_at IS NULL
+ORDER BY created_at DESC LIMIT 100`, ident.TenantID.String())
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type view struct {
+		ID          string    `json:"id"`
+		MetricID    string    `json:"metric_id"`
+		Name        string    `json:"name"`
+		DisplayName string    `json:"display_name"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	out := []view{}
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.ID, &v.MetricID, &v.Name, &v.DisplayName, &v.CreatedAt); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		out = append(out, v)
+	}
+	writeOK(w, out)
+}
+
+// listRateCards 列出费率卡。
+func (s *Server) listRateCards(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT id::text, name, version, currency, is_active, valid_from, created_at
+FROM rate_cards WHERE tenant_id=$1::uuid AND deleted_at IS NULL
+ORDER BY created_at DESC LIMIT 100`, ident.TenantID.String())
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type view struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Version   int       `json:"version"`
+		Currency  string    `json:"currency"`
+		IsActive  bool      `json:"is_active"`
+		ValidFrom time.Time `json:"valid_from"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	out := []view{}
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.ID, &v.Name, &v.Version, &v.Currency, &v.IsActive, &v.ValidFrom, &v.CreatedAt); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		out = append(out, v)
+	}
+	writeOK(w, out)
+}
+
 func (s *Server) createBillableMetric(w http.ResponseWriter, r *http.Request) {
 	ident := requireScope(w, r, rbac.ScopeAdmin)
 	if ident == nil {
@@ -317,6 +421,96 @@ VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, $5::jsonb, $6, $7) RETURNING id::text
 		return
 	}
 	writeOK(w, map[string]string{"id": idStr})
+}
+
+// listRateRules 列出费率卡下的定价规则（幂等供给用）。
+func (s *Server) listRateRules(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	cardID, ok := pathID(w, r, "id")
+	if !ok {
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `
+SELECT r.id::text, r.product_id::text, r.match_conditions, r.pricing_type, r.priority, r.is_default_rule, r.created_at
+FROM rate_card_rules r
+JOIN rate_cards c ON c.id = r.rate_card_id
+WHERE r.rate_card_id=$1::uuid AND c.tenant_id=$2::uuid AND r.deleted_at IS NULL
+ORDER BY r.priority DESC, r.created_at LIMIT 100`,
+		cardID.String(), ident.TenantID.String())
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type view struct {
+		ID              string            `json:"id"`
+		ProductID       string            `json:"product_id"`
+		MatchConditions map[string]string `json:"match_conditions"`
+		PricingType     string            `json:"pricing_type"`
+		Priority        int               `json:"priority"`
+		IsDefaultRule   bool              `json:"is_default_rule"`
+		CreatedAt       time.Time         `json:"created_at"`
+	}
+	out := []view{}
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.ID, &v.ProductID, &v.MatchConditions, &v.PricingType, &v.Priority, &v.IsDefaultRule, &v.CreatedAt); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		out = append(out, v)
+	}
+	writeOK(w, out)
+}
+
+// listContracts 列出合同（幂等供给用，支持 customer_id 过滤）。
+func (s *Server) listContracts(w http.ResponseWriter, r *http.Request) {
+	ident := requireScope(w, r, rbac.ScopeAdmin)
+	if ident == nil {
+		return
+	}
+	customerID, err := customerFilter(r, ident)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	args := []interface{}{ident.TenantID.String()}
+	query := `
+SELECT id::text, customer_id::text, rate_card_id::text, start_time, end_time, is_terminated, created_at
+FROM contracts WHERE tenant_id=$1::uuid AND deleted_at IS NULL`
+	if customerID != nil {
+		query += ` AND customer_id=$2::uuid`
+		args = append(args, customerID.String())
+	}
+	query += ` ORDER BY created_at DESC LIMIT 100`
+	rows, err := s.db.Query(r.Context(), query, args...)
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+	defer rows.Close()
+	type view struct {
+		ID           string     `json:"id"`
+		CustomerID   string     `json:"customer_id"`
+		RateCardID   string     `json:"rate_card_id"`
+		StartTime    time.Time  `json:"start_time"`
+		EndTime      *time.Time `json:"end_time"`
+		IsTerminated bool       `json:"is_terminated"`
+		CreatedAt    time.Time  `json:"created_at"`
+	}
+	out := []view{}
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.ID, &v.CustomerID, &v.RateCardID, &v.StartTime, &v.EndTime, &v.IsTerminated, &v.CreatedAt); err != nil {
+			writeErr(w, common.ErrInternal.Wrap(err))
+			return
+		}
+		out = append(out, v)
+	}
+	writeOK(w, out)
 }
 
 func (s *Server) createContract(w http.ResponseWriter, r *http.Request) {

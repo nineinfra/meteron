@@ -95,7 +95,9 @@ func (w *Worker) deepLoop(ctx context.Context) {
 }
 
 func (w *Worker) runLightAllTenants(ctx context.Context) {
-	hour := time.Now().UTC().Add(-time.Hour).Truncate(time.Hour)
+	// 对账 (now-65min) 所在小时：MeterWorker 在小时关闭 +2min 宽限后才落盘
+	// hourly 聚合，取更早的小时保证聚合数据已可见，避免误报差异。
+	hour := time.Now().UTC().Add(-65 * time.Minute).Truncate(time.Hour)
 	tenants, err := w.listTenants(ctx)
 	if err != nil {
 		w.log.Error("recon light: list tenants failed", "err", err)

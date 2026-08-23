@@ -74,8 +74,15 @@ func NewClickHouse(ctx context.Context, dsn string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.Exec(ctx, ddl); err != nil {
-		return nil, fmt.Errorf("apply clickhouse ddl: %w", err)
+	// clickhouse-go 不支持 multi-statement：按分号拆分逐条执行（幂等 CREATE IF NOT EXISTS）
+	for _, stmt := range strings.Split(ddl, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if err := conn.Exec(ctx, stmt); err != nil {
+			return nil, fmt.Errorf("apply clickhouse ddl: %w", err)
+		}
 	}
 	return conn, nil
 }

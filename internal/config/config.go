@@ -15,9 +15,9 @@ import (
 
 type ProviderConfig struct {
 	Name    string   `yaml:"name"`    // provider 名称，route_rules.target_provider 引用
-	Type    string   `yaml:"type"`    // openai | anthropic | mock
+	Type    string   `yaml:"type"`    // openai | openai-compatible | local | anthropic | mock
 	BaseURL string   `yaml:"base_url"`
-	APIKey  string   `yaml:"api_key"` // 支持 ${ENV_VAR} 展开
+	APIKey  string   `yaml:"api_key"` // 支持 ${ENV_VAR} 展开；local 类型可留空
 	Models  []string `yaml:"models"`  // 该 provider 承载的模型列表（无路由规则时按 model 反查 provider）
 }
 

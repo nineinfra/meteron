@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Mock 本地模拟 Provider：无外部依赖即可跑通 demo 闭环。
+// Mock 本地模拟 Provider：无外部依赖即可跑通全链路验证。
 // 用量确定性生成：input_tokens ≈ len(body)/4，output_tokens 默认 64（不超过 max_tokens）。
 type Mock struct {
 	name string

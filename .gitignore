@@ -5,11 +5,19 @@
 *.test
 *.out
 
+# 前端构建产物（保留占位 index.html）
+internal/ui/dist/*
+!internal/ui/dist/index.html
+web/node_modules/
+
 # 本地环境
 .env
 *.local.yaml
+debug.log
+*.lnk
 
 # IDE
 .idea/
 .vscode/
 *.swp
+

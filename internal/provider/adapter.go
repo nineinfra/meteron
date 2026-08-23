@@ -52,10 +52,12 @@ func NewRegistry(cfgs []config.ProviderConfig, timeout time.Duration) (*Registry
 	for _, c := range cfgs {
 		var a Adapter
 		switch c.Type {
-		case "openai", "openai-compatible":
+		case "openai", "openai-compatible", "local":
 			if c.BaseURL == "" {
-				return nil, fmt.Errorf("provider %s: openai 类型必须配置 base_url", c.Name)
+				return nil, fmt.Errorf("provider %s: %s 类型必须配置 base_url", c.Name, c.Type)
 			}
+			// local：本地部署模型（Ollama / vLLM / LM Studio / llama.cpp-server 等
+			// OpenAI 兼容端点），api_key 可留空（适配器仅在非空时携带 Authorization 头）
 			a = NewOpenAICompatible(c.Name, c.BaseURL, c.APIKey, timeout)
 		case "anthropic":
 			if c.BaseURL == "" {

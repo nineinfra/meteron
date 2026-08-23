@@ -140,10 +140,13 @@ type pendingMsg struct {
 // 桶写入成功后，才提交该小时对应消息的 offset（crash 后从上次提交点重放，不丢数据）。
 func (w *MeterWorker) flushClosed(now time.Time) {
 	w.mu.Lock()
+	// cutoff = (now-2min) 所在小时：仅落盘严格早于该小时的桶（小时已关闭 + 2min 宽限）。
+	// 不可包含 Equal——否则未关闭的当前小时桶会被提前落盘并删除，
+	// 桶内 seenIDs 去重集合随之丢失（同小时内 Kafka 重投递将重复累计）。
 	cutoff := now.Add(-2 * time.Minute).Truncate(time.Hour)
 	var toFlush []*hourBucket
 	for k, b := range w.buckets {
-		if b.hour.Before(cutoff) || b.hour.Equal(cutoff) {
+		if b.hour.Before(cutoff) {
 			toFlush = append(toFlush, b)
 			delete(w.buckets, k)
 		}

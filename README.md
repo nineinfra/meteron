@@ -10,20 +10,34 @@
 | **实时预算管控** | 请求前预留、响应后确认的两阶段预算；超支可阻断/告警/自动降级廉价模型，绝不超卖 |
 | **精确计费** | 计量事件内嵌费率快照，费率改价不影响历史账单；支持阶梯计价与缓存 token 差异化定价 |
 | **账实一致** | 计量明细（ClickHouse）与账本流水（PostgreSQL）双轨自动对账，差异自动生成红冲/补差流水 |
+| **Web 控制台** | 内嵌可视化看板：token 用量趋势、模型用量明细、预算池余额、账单管理，零前端依赖 |
 | **数据自持** | 全栈自托管（PG / ClickHouse / Redis / Kafka），多租户 + RBAC 隔离 |
 
 ## 快速开始（2 条命令）
 
 ```bash
 docker compose up -d --build   # 启动全栈 + Meteron（内置 mock provider，无需任何 API Key）
-./scripts/demo.sh              # 端到端演示：建客户→对话→计量→出账→定稿→对账
+./scripts/verify.sh            # 端到端验证：建客户→对话→计量→出账→定稿→对账
 ```
 
-> demo 仅依赖 `bash` + `curl`。服务就绪约需 30~60 秒（首次拉镜像较慢）。
+> 验证脚本仅依赖 `bash` + `curl`，幂等可重复执行。服务就绪约需 30~60 秒（首次拉镜像较慢）。
+
+## Web 控制台
+
+启动后浏览器打开 **`http://localhost:8080/`**，输入 API Key（开发环境默认
+`mk_meteron_bootstrap_dev_key`）即可看到：
+
+- **KPI 卡片**：请求数、输入/输出/缓存命中 tokens（支持 24h / 7d / 30d 切换）
+- **用量趋势图**：小时粒度输入/输出 token 堆叠柱状图（超 96 点自动按天聚合）
+- **用量明细**：按模型 × Provider × 任务类型的 token 消耗与请求数
+- **预算池**：实时余额、花费进度条（80% 预警 / 100% 告警变色）、在途预留、超支策略
+- **账单**：金额、账期、状态，draft 账单一键定稿
+
+控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），每 60 秒自动刷新。
 
 ## 30 秒手工体验
 
-demo 之外，核心闭环只需三步（`KEY` 为引导 API Key）：
+自动验证之外，核心闭环手工只需三步（`KEY` 为引导 API Key）：
 
 ```bash
 # 1. 建客户（拿到 customer_id）
@@ -49,7 +63,7 @@ curl -s "localhost:8080/api/v1/usage?customer_id=<第1步返回的id>" \
 ## 工作原理
 
 ```
-应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/mock)
+应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/本地模型/mock)
                        │ 预算预留(Redis+PG)      │ usage 嗅探(含 SSE 流式)
                        ▼                         ▼
                     Kafka meter-events ──▶ ClickHouse 明细 + 小时预聚合
@@ -64,7 +78,7 @@ curl -s "localhost:8080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 ## 生产级使用步骤
 
-按顺序执行即可从 demo 环境升级为生产环境。
+按顺序执行即可从验证环境升级为生产环境。
 
 ### 1. 密钥加固（必做）
 
@@ -91,7 +105,7 @@ METERON_BOOTSTRAP_API_KEY=<强随机值>     # 首次启动自动创建为 admin
 ```yaml
 providers:
   - name: openai-main
-    type: openai            # openai | anthropic | mock
+    type: openai            # openai | openai-compatible | local | anthropic | mock
     base_url: "https://api.openai.com/v1"
     api_key: "sk-..."
     models: ["gpt-4o", "gpt-4o-mini"]
@@ -100,11 +114,15 @@ providers:
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     api_key: "..."
     models: ["glm-4.6"]
+  - name: ollama            # 本地部署模型：Ollama / vLLM / LM Studio 等 OpenAI 兼容端点，api_key 可留空
+    type: local
+    base_url: "http://localhost:11434/v1"
+    models: ["llama3.1", "qwen2.5:7b"]
 ```
 
 ### 3. 完成计费供给（每个计费客户一次）
 
-7 个 API 依次调用，完整参数见 `scripts/demo.sh` 第 1 段（可直接复制改值）：
+7 个 API 依次调用，完整参数见 `scripts/verify.sh` 第 1 段（可直接复制改值）：
 
 ```
 客户 → 计量指标(billable-metrics) → 产品(products) → 费率卡(rate-cards)
@@ -160,4 +178,4 @@ go build ./...   # 构建
 go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义）
 ```
 
-模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）。
+模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ui`（Web 控制台）。
