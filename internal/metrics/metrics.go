@@ -76,4 +76,31 @@ var (
 		},
 		[]string{"pool_id"},
 	)
+
+	// ProviderHealthErrorRate 渠道滑动窗口错误率（0~1，含真实流量与主动探测样本）
+	ProviderHealthErrorRate = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "provider_health_error_rate",
+			Help: "Provider error rate in sliding window (real traffic + probes)",
+		},
+		[]string{"provider"},
+	)
+
+	// ProviderHealthAvgLatencySeconds 渠道平均延迟（秒）
+	ProviderHealthAvgLatencySeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "provider_health_avg_latency_seconds",
+			Help: "Provider average latency in sliding window",
+		},
+		[]string{"provider"},
+	)
+
+	// ProviderDisabled 渠道禁用状态（1=禁用；reason: auto 自动禁用 / manual 人工禁用 / none 正常）
+	ProviderDisabled = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "provider_disabled",
+			Help: "Provider disabled state (1=disabled) by reason",
+		},
+		[]string{"provider", "reason"},
+	)
 )

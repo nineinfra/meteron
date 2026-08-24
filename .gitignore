@@ -16,6 +16,9 @@ web/node_modules/
 debug.log
 *.lnk
 
+# 本地 Go 工具链（便携版，CI/容器构建不依赖）
+.gotoolchain/
+
 # docker compose 数据目录（bind mount）
 deploy/data/
 

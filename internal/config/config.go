@@ -21,6 +21,23 @@ type ProviderConfig struct {
 	Models  []string `yaml:"models"`  // 该 provider 承载的模型列表（无路由规则时按 model 反查 provider）
 }
 
+// RateLimit 双重限流配置（参考 sub2api：客户维度 + 上游 Provider 账号维度）。
+// 0 表示不限制对应维度。
+type RateLimit struct {
+	CustomerRPM          int64 `yaml:"customer_rpm"`           // 客户维度每分钟请求数
+	CustomerTPM          int64 `yaml:"customer_tpm"`           // 客户维度每分钟 token 数（按请求 input+max_tokens 估算）
+	CustomerMaxConcurr   int64 `yaml:"customer_max_concurrent"` // 客户维度最大并发
+	ProviderMaxConcurr   int64 `yaml:"provider_max_concurrent"` // 上游 Provider 渠道维度最大并发（防止打爆上游账号）
+}
+
+// Health 渠道健康探测配置（参考 new-api 渠道管理）。
+type Health struct {
+	ProbeInterval     time.Duration `yaml:"probe_interval"`      // 主动探测间隔（连通性检查，0=关闭主动探测）
+	Window            time.Duration `yaml:"window"`              // 错误率统计滑动窗口
+	ErrorRateThreshold float64      `yaml:"error_rate_threshold"` // 窗口内错误率超过该阈值自动禁用（0~1）
+	MinSamples         int64        `yaml:"min_samples"`         // 触发自动禁用的最小样本数（防小样本误杀）
+}
+
 type Business struct {
 	EventLookbackWindowDays  int           `yaml:"event_lookback_window_days"`  // 晚到事件回溯窗口，默认34天
 	ReserveDefaultTTLSeconds int           `yaml:"reserve_default_ttl_seconds"` // 预留默认TTL，默认60s
@@ -48,6 +65,8 @@ type Config struct {
 	BootstrapKey  string           `yaml:"bootstrap_api_key"` // 首次启动引导 API Key（明文，仅用于初始化）
 	Providers     []ProviderConfig `yaml:"providers"`
 	Business      Business         `yaml:"business"`
+	RateLimit     RateLimit        `yaml:"rate_limit"`
+	Health        Health           `yaml:"health"`
 }
 
 func Default() *Config {
@@ -71,6 +90,14 @@ func Default() *Config {
 	c.Business.BillingInterval = 0
 	c.Business.ReconLightInterval = time.Hour
 	c.Business.ReconDeepInterval = 24 * time.Hour
+	c.RateLimit.CustomerRPM = 0
+	c.RateLimit.CustomerTPM = 0
+	c.RateLimit.CustomerMaxConcurr = 0
+	c.RateLimit.ProviderMaxConcurr = 0
+	c.Health.ProbeInterval = 60 * time.Second
+	c.Health.Window = 5 * time.Minute
+	c.Health.ErrorRateThreshold = 0.5
+	c.Health.MinSamples = 10
 	c.Providers = []ProviderConfig{
 		// 默认模型：本机 Ollama 的 qwen3.5:9b（OpenAI 兼容端点，api_key 留空）。
 		// 容器内经 host.docker.internal 访问宿主机 Ollama；宿主机直跑时由 config.yaml 覆盖为 localhost。
@@ -159,6 +186,25 @@ func applyEnv(c *Config) {
 	setDuration("METERON_BILLING_INTERVAL", func(d time.Duration) { c.Business.BillingInterval = d })
 	setDuration("METERON_RECON_LIGHT_INTERVAL", func(d time.Duration) { c.Business.ReconLightInterval = d })
 	setDuration("METERON_RECON_DEEP_INTERVAL", func(d time.Duration) { c.Business.ReconDeepInterval = d })
+	setInt := func(k string, fn func(int64)) {
+		set(k, func(v string) {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				fn(n)
+			}
+		})
+	}
+	setInt("METERON_RATE_LIMIT_CUSTOMER_RPM", func(n int64) { c.RateLimit.CustomerRPM = n })
+	setInt("METERON_RATE_LIMIT_CUSTOMER_TPM", func(n int64) { c.RateLimit.CustomerTPM = n })
+	setInt("METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT", func(n int64) { c.RateLimit.CustomerMaxConcurr = n })
+	setInt("METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT", func(n int64) { c.RateLimit.ProviderMaxConcurr = n })
+	setDuration("METERON_HEALTH_PROBE_INTERVAL", func(d time.Duration) { c.Health.ProbeInterval = d })
+	setDuration("METERON_HEALTH_WINDOW", func(d time.Duration) { c.Health.Window = d })
+	set("METERON_HEALTH_ERROR_RATE_THRESHOLD", func(v string) {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Health.ErrorRateThreshold = f
+		}
+	})
+	setInt("METERON_HEALTH_MIN_SAMPLES", func(n int64) { c.Health.MinSamples = n })
 }
 
 func validate(c *Config) error {
@@ -186,6 +232,20 @@ func validate(c *Config) error {
 	}
 	if c.Business.EstimateDefaultMaxTokens < 0 {
 		c.Business.EstimateDefaultMaxTokens = 1024
+	}
+	if c.Health.Window <= 0 {
+		c.Health.Window = 5 * time.Minute
+	}
+	if c.Health.ErrorRateThreshold <= 0 || c.Health.ErrorRateThreshold > 1 {
+		c.Health.ErrorRateThreshold = 0.5
+	}
+	if c.Health.MinSamples <= 0 {
+		c.Health.MinSamples = 10
+	}
+	// 限流配置不允许负值（负值会被 Redis 比较逻辑误判为超限）
+	if c.RateLimit.CustomerRPM < 0 || c.RateLimit.CustomerTPM < 0 ||
+		c.RateLimit.CustomerMaxConcurr < 0 || c.RateLimit.ProviderMaxConcurr < 0 {
+		return fmt.Errorf("rate_limit 配置不允许负值")
 	}
 	return nil
 }

@@ -114,3 +114,94 @@ func TestLegacyKeyHashDeterministic(t *testing.T) {
 		t.Fatalf("legacyKeyHash collision")
 	}
 }
+
+// ---- IPAllowed：IP 白名单 ----
+
+func TestIPAllowed(t *testing.T) {
+	cases := []struct {
+		name     string
+		whitelist []string
+		ip       string
+		want     bool
+	}{
+		{"空白名单不限制", nil, "1.2.3.4", true},
+		{"空白名单不限制(空数组)", []string{}, "8.8.8.8", true},
+		{"单 IP 精确命中", []string{"1.2.3.4", "5.6.7.8"}, "1.2.3.4", true},
+		{"单 IP 未命中", []string{"1.2.3.4"}, "1.2.3.5", false},
+		{"CIDR 命中", []string{"10.0.0.0/8"}, "10.1.2.3", true},
+		{"CIDR 未命中", []string{"10.0.0.0/8"}, "11.0.0.1", false},
+		{"CIDR 边界(网络地址)", []string{"192.168.1.0/24"}, "192.168.1.0", true},
+		{"CIDR 边界(广播地址)", []string{"192.168.1.0/24"}, "192.168.1.255", true},
+		{"CIDR 边界外", []string{"192.168.1.0/24"}, "192.168.2.1", false},
+		{"混合 单IP+CIDR", []string{"1.2.3.4", "10.0.0.0/8"}, "10.9.9.9", true},
+		{"IPv6 精确命中", []string{"::1"}, "::1", true},
+		{"IPv6 CIDR 命中", []string{"2001:db8::/32"}, "2001:db8::1", true},
+		{"IPv6 未命中", []string{"2001:db8::/32"}, "2001:db9::1", false},
+		{"IPv4 映射 IPv6 归一化", []string{"127.0.0.1"}, "127.0.0.1", true},
+		{"非法来源 IP fail-closed", []string{"1.2.3.4"}, "not-an-ip", false},
+		{"空来源 IP fail-closed", []string{"1.2.3.4"}, "", false},
+		{"白名单含非法条目跳过", []string{"garbage", "1.2.3.4"}, "1.2.3.4", true},
+		{"白名单含非法 CIDR 跳过", []string{"10.0.0.0/64", "1.2.3.4"}, "1.2.3.4", true},
+		{"全部非法条目且不匹配", []string{"garbage", "10.0.0.0/64"}, "1.2.3.4", false},
+		{"空白字符容忍", []string{" 1.2.3.4 "}, "1.2.3.4", true},
+		{"IPv4-mapped IPv6 解析为 IPv4 命中", []string{"1.2.3.4"}, "::ffff:1.2.3.4", true},
+	}
+	for _, c := range cases {
+		if got := IPAllowed(c.whitelist, c.ip); got != c.want {
+			t.Errorf("%s: IPAllowed(%v, %q) = %v, want %v", c.name, c.whitelist, c.ip, got, c.want)
+		}
+	}
+}
+
+// IPAllowed fail-closed 语义：有白名单 + 无法解析来源 => 拒绝
+func TestIPAllowedFailClosed(t *testing.T) {
+	if IPAllowed([]string{"0.0.0.0/0"}, "") {
+		t.Fatal("empty remote IP with non-empty whitelist must be rejected")
+	}
+}
+
+// ---- ModelAllowed：模型白名单 ----
+
+func TestModelAllowed(t *testing.T) {
+	cases := []struct {
+		name      string
+		allowList []string
+		model     string
+		want      bool
+	}{
+		{"空白名单允许全部", nil, "any-model", true},
+		{"空白名单允许全部(空数组)", []string{}, "gpt-4", true},
+		{"命中", []string{"gpt-4", "claude-3"}, "gpt-4", true},
+		{"未命中", []string{"gpt-4"}, "gpt-3.5", false},
+		{"空模型名未命中", []string{"gpt-4"}, "", false},
+		{"大小写敏感", []string{"GPT-4"}, "gpt-4", false},
+	}
+	for _, c := range cases {
+		if got := ModelAllowed(c.allowList, c.model); got != c.want {
+			t.Errorf("%s: ModelAllowed(%v, %q) = %v, want %v", c.name, c.allowList, c.model, got, c.want)
+		}
+	}
+}
+
+// Identity 携带白名单字段：鉴权后网关可直接使用（字段存在性/传递性编译期由调用方保证，
+// 此处验证零值 Identity 白名单为空 => 全放行，保证升级存量密钥行为不变）。
+func TestIdentityDefaultAllowsAll(t *testing.T) {
+	ident := &Identity{}
+	if !IPAllowed(ident.IPWhitelist, "1.2.3.4") {
+		t.Fatal("nil IPWhitelist should allow all IPs")
+	}
+	if !ModelAllowed(ident.ModelAllowList, "gpt-4") {
+		t.Fatal("nil ModelAllowList should allow all models")
+	}
+}
+
+// toPGTextArray：nil 规范化为空数组（PG 插入空数组而非 NULL）
+func TestToPGTextArray(t *testing.T) {
+	if got := toPGTextArray(nil); got == nil || len(got) != 0 {
+		t.Fatalf("toPGTextArray(nil) = %v, want empty non-nil slice", got)
+	}
+	in := []string{"a"}
+	if got := toPGTextArray(in); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("toPGTextArray non-empty mutated: %v", got)
+	}
+}

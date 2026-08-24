@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -22,11 +23,13 @@ import (
 
 	"github.com/meteron/meteron/internal/common"
 	"github.com/meteron/meteron/internal/config"
+	"github.com/meteron/meteron/internal/health"
 	"github.com/meteron/meteron/internal/ingest"
 	"github.com/meteron/meteron/internal/ledger"
 	"github.com/meteron/meteron/internal/metrics"
 	"github.com/meteron/meteron/internal/pricing"
 	"github.com/meteron/meteron/internal/provider"
+	"github.com/meteron/meteron/internal/ratelimit"
 	"github.com/meteron/meteron/internal/rbac"
 	"github.com/meteron/meteron/internal/router"
 )
@@ -54,6 +57,8 @@ type Handler struct {
 	db        *pgxpool.Pool
 	cfg       *config.Config
 	log       *slog.Logger
+	health    *health.Tracker       // 渠道健康（nil=未启用）
+	limiter   ratelimit.Limiter     // 双重限流（nil=未启用）
 }
 
 func NewHandler(
@@ -67,12 +72,15 @@ func NewHandler(
 	db *pgxpool.Pool,
 	cfg *config.Config,
 	log *slog.Logger,
+	healthTracker *health.Tracker,
+	limiter ratelimit.Limiter,
 ) *Handler {
 	return &Handler{
 		auth: auth, ledgerSvc: ledgerSvc, ledgerSt: ledgerSt,
 		router: routerEngine, pricing: pricingEngine,
 		providers: providers, producer: producer, db: db,
 		cfg: cfg, log: log,
+		health: healthTracker, limiter: limiter,
 	}
 }
 
@@ -85,6 +93,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.authenticate(r)
 	if err != nil {
 		writeErr(w, common.ErrUnauthorized.Wrap(err))
+		return
+	}
+
+	// 1.5 密钥 IP 白名单（空名单不限制；fail-closed：有名单但来源 IP 不可解析则拒绝）
+	if !rbac.IPAllowed(ident.IPWhitelist, clientIP(r)) {
+		writeErr(w, common.ErrIPNotAllowed.Wrap(errors.New("source ip not in key whitelist")))
 		return
 	}
 
@@ -118,6 +132,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+
+	// 3.5 客户维度限流：RPM（cost=请求）/ TPM（cost=估算 token）/ 最大并发。
+	// 保护性限流 fail-open：Redis 故障时放行并告警（区别于预算的 fail-closed）。
+	if release, ok := h.applyCustomerRateLimits(w, ctx, ident.TenantID, customerID, &chatReq); !ok {
+		return // writeErr 已在内部完成
+	} else if release != nil {
+		defer release()
 	}
 
 	// 4. transaction_id：优先映射 X-Idempotency-Key（UUIDv5），否则新建
@@ -202,7 +224,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Provider 适配器（fallback 可能已切换 provider）
+	// 7. Provider 适配器（fallback 可能已切换 provider）+ 渠道健康降级 + 密钥模型白名单
+	// 7.1 健康检查：渠道被禁用时自动切换 fallback 渠道（均不可用则拒绝）
+	if h.health != nil && h.health.IsDisabled(route.Provider) {
+		if route.FallbackProvider != "" && route.FallbackProvider != route.Provider &&
+			!h.health.IsDisabled(route.FallbackProvider) {
+			h.log.Warn("provider disabled by health check, fallback",
+				"from", route.Provider, "to", route.FallbackProvider)
+			route.Provider, route.Model = route.FallbackProvider, route.FallbackModel
+		} else {
+			if reservation != nil {
+				_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
+			}
+			writeErr(w, common.ErrNoProvider.Wrap(fmt.Errorf("provider %q disabled (health)", route.Provider)))
+			return
+		}
+	}
+	// 7.2 密钥模型白名单：校验最终转发模型（路由/fallback 调整后），密钥约束优先于路由策略
+	if !rbac.ModelAllowed(ident.ModelAllowList, route.Model) {
+		if reservation != nil {
+			_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
+		}
+		writeErr(w, common.ErrModelNotAllowed.Wrap(fmt.Errorf("model %q not in key allow list", route.Model)))
+		return
+	}
 	adapter, ok := h.providers.Get(route.Provider)
 	if !ok {
 		if reservation != nil {
@@ -210,6 +255,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeErr(w, common.ErrNoProvider.Wrap(fmt.Errorf("provider %q", route.Provider)))
 		return
+	}
+
+	// 7.3 上游 Provider 渠道并发限制（保护上游账号不被打爆；fail-open）
+	if h.limiter != nil {
+		release, ok, err := h.limiter.Acquire(ctx, providerConcKey(route.Provider), h.cfg.RateLimit.ProviderMaxConcurr)
+		if err != nil {
+			h.log.Warn("provider concurrency check failed (fail-open)", "provider", route.Provider, "err", err)
+		} else if !ok {
+			if reservation != nil {
+				_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
+			}
+			writeErr(w, common.ErrConcurrencyLimited.Wrap(fmt.Errorf("provider %q", route.Provider)))
+			return
+		} else if release != nil {
+			defer release()
+		}
 	}
 
 	// 8. 计价上下文快照（请求匹配成功时刻固化）
@@ -230,18 +291,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := &provider.ChatRequest{Model: route.Model, Body: body, Stream: chatReq.Stream}
+	upStart := time.Now()
 	result, err := adapter.Chat(ctx, req)
 	if err != nil {
+		h.observeHealth(route.Provider, false, time.Since(upStart))
 		if reservation != nil {
 			_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID) // 未产生 usage：全额释放
 		}
+		// 审计：网络层失败请求也入计量明细（status_code=502，tokens=0）
+		h.emitFailureEvent(ctx, ident.TenantID, customerID, txnID, route, taskType, agentID, snapshot, body, reservation, idemKey, chatReq.Model, http.StatusBadGateway)
 		writeErr(w, common.ErrUpstream.Wrap(err))
 		return
 	}
+	h.observeHealth(route.Provider, result.StatusCode < 400, time.Since(upStart))
 	if result.StatusCode >= 400 {
 		if reservation != nil {
 			_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
 		}
+		// 审计：上游 4xx/5xx 请求入计量明细（真实 status_code，tokens=0）
+		h.emitFailureEvent(ctx, ident.TenantID, customerID, txnID, route, taskType, agentID, snapshot, body, reservation, idemKey, chatReq.Model, result.StatusCode)
 		w.Header().Set("Content-Type", result.ContentType)
 		w.WriteHeader(result.StatusCode)
 		_, _ = w.Write(result.Body)
@@ -265,7 +333,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"reservation_id", reservation.ID, "err", cerr)
 			}
 		}
-		ev := h.buildEvent(ident.TenantID, customerID, txnID, route, taskType, agentID, snapshot, usage, body, reservation, idemKey, chatReq.Model)
+		ev := h.buildEvent(ident.TenantID, customerID, txnID, route, taskType, agentID, snapshot, usage, body, reservation, idemKey, chatReq.Model, result.StatusCode)
 		if perr := h.producer.Produce(fctx, ev); perr != nil {
 			h.log.Error("produce meter event failed", "event_id", ev.EventID, "err", perr)
 		}
@@ -349,6 +417,16 @@ func (m chatMessage) textLen() int {
 }
 
 func (h *Handler) estimateAmount(req *chatRequest) decimal.Decimal {
+	price, err := decimal.NewFromString(h.cfg.Business.EstimateUnitPrice)
+	if err != nil {
+		price = decimal.Zero
+	}
+	return price.Mul(decimal.NewFromInt(int64(h.estimateTokens(req))))
+}
+
+// estimateTokens 预估本次请求 token 数：输入字符折算 + max_tokens 上限。
+// 供预算预留与 TPM 限流共用。
+func (h *Handler) estimateTokens(req *chatRequest) uint64 {
 	chars := 0
 	for _, m := range req.Messages {
 		chars += m.textLen()
@@ -362,12 +440,103 @@ func (h *Handler) estimateAmount(req *chatRequest) decimal.Decimal {
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		maxTok = *req.MaxTokens
 	}
-	estTokens += uint64(maxTok)
-	price, err := decimal.NewFromString(h.cfg.Business.EstimateUnitPrice)
-	if err != nil {
-		price = decimal.Zero
+	return estTokens + uint64(maxTok)
+}
+
+// clientIP 提取来源 IP：优先 X-Forwarded-For 首段（反代场景），否则 RemoteAddr。
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
 	}
-	return price.Mul(decimal.NewFromInt(int64(estTokens)))
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// 客户维度限流 key（Redis 键空间：rl = rate limit）
+func customerRateKey(tenantID, customerID uuid.UUID, dim string) string {
+	return "rl:c:" + tenantID.String() + ":" + customerID.String() + ":" + dim
+}
+
+func providerConcKey(providerName string) string {
+	return "rl:p:" + providerName + ":conc"
+}
+
+// applyCustomerRateLimits 客户维度双重限流：
+// RPM（每分钟请求数，cost=1）/ TPM（每分钟 token 数，cost=预估 token）/ 最大并发。
+// 返回 (release, true) 放行（release 可为 nil=未启用并发限制），(nil, false) 已写错误响应。
+// Redis 故障时 fail-open（限流是保护性措施，不应因缓存故障阻断业务）。
+func (h *Handler) applyCustomerRateLimits(w http.ResponseWriter, ctx context.Context, tenantID, customerID uuid.UUID, chatReq *chatRequest) (func(), bool) {
+	if h.limiter == nil {
+		return nil, true
+	}
+	rl := h.cfg.RateLimit
+	// RPM
+	if rl.CustomerRPM > 0 {
+		ok, err := h.limiter.AllowRate(ctx, customerRateKey(tenantID, customerID, "rpm"), rl.CustomerRPM, 1, time.Minute)
+		if err != nil {
+			h.log.Warn("customer rpm check failed (fail-open)", "customer_id", customerID, "err", err)
+		} else if !ok {
+			writeErr(w, common.ErrRateLimited.Wrap(fmt.Errorf("customer rpm limit %d/min", rl.CustomerRPM)))
+			return nil, false
+		}
+	}
+	// TPM
+	if rl.CustomerTPM > 0 {
+		ok, err := h.limiter.AllowRate(ctx, customerRateKey(tenantID, customerID, "tpm"), rl.CustomerTPM,
+			int64(h.estimateTokens(chatReq)), time.Minute)
+		if err != nil {
+			h.log.Warn("customer tpm check failed (fail-open)", "customer_id", customerID, "err", err)
+		} else if !ok {
+			writeErr(w, common.ErrRateLimited.Wrap(fmt.Errorf("customer tpm limit %d/min", rl.CustomerTPM)))
+			return nil, false
+		}
+	}
+	// 并发
+	if rl.CustomerMaxConcurr > 0 {
+		release, ok, err := h.limiter.Acquire(ctx, customerRateKey(tenantID, customerID, "conc"), rl.CustomerMaxConcurr)
+		if err != nil {
+			h.log.Warn("customer concurrency check failed (fail-open)", "customer_id", customerID, "err", err)
+			return nil, true
+		}
+		if !ok {
+			writeErr(w, common.ErrConcurrencyLimited.Wrap(fmt.Errorf("customer max concurrent %d", rl.CustomerMaxConcurr)))
+			return nil, false
+		}
+		return release, true
+	}
+	return nil, true
+}
+
+// observeHealth 真实流量结果计入渠道健康统计（nil 安全）。
+func (h *Handler) observeHealth(providerName string, success bool, latency time.Duration) {
+	if h.health != nil {
+		h.health.Observe(providerName, success, latency)
+	}
+}
+
+// emitFailureEvent 上游失败请求（网络错误 / 4xx / 5xx）审计事件：
+// tokens=0、status_code 如实记录，账单不产生费用（预留已全额释放），
+// 但审计日志可按状态码检索失败请求。
+func (h *Handler) emitFailureEvent(
+	ctx context.Context,
+	tenantID, customerID, txnID uuid.UUID,
+	route *router.RouteResult, taskType, agentID string,
+	snapshot *pricing.Snapshot, rawBody []byte,
+	reservation *ledger.Reservation, idemKey, requestedModel string,
+	statusCode int,
+) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ev := h.buildEvent(tenantID, customerID, txnID, route, taskType, agentID, snapshot, nil, rawBody, reservation, idemKey, requestedModel, statusCode)
+	if perr := h.producer.Produce(fctx, ev); perr != nil {
+		h.log.Error("produce failure audit event failed", "event_id", ev.EventID, "err", perr)
+	}
 }
 
 func (h *Handler) poolAvailRatio(ctx context.Context, pool *ledger.Pool) float64 {
@@ -430,6 +599,7 @@ func (h *Handler) buildEvent(
 	route *router.RouteResult, taskType, agentID string,
 	snapshot *pricing.Snapshot, usage *provider.Usage,
 	rawBody []byte, reservation *ledger.Reservation, idemKey, requestedModel string,
+	statusCode int,
 ) *ingest.MeterEvent {
 	providerName := route.Provider
 	modelName := route.Model
@@ -454,7 +624,7 @@ func (h *Handler) buildEvent(
 	if len(raw) > 64*1024 {
 		raw = raw[:64*1024]
 	}
-	return &ingest.MeterEvent{
+	ev := &ingest.MeterEvent{
 		EventID:                uuid.New(),
 		TransactionID:          txnID,
 		EventVersion:           1,
@@ -466,14 +636,19 @@ func (h *Handler) buildEvent(
 		Model:                  modelName,
 		TaskType:               taskType,
 		AgentID:                agentID,
-		InputTokens:            usage.InputTokens,
-		OutputTokens:           usage.OutputTokens,
-		CachedInputTokens:      usage.CachedInputTokens,
 		PricingContextSnapshot: snapshot,
 		Currency:               currency,
 		Metadata:               metadata,
 		RawPayload:             raw,
+		StatusCode:             uint16(statusCode),
 	}
+	// usage=nil：上游失败审计事件（tokens 全零，仅审计检索，不产生费用）
+	if usage != nil {
+		ev.InputTokens = usage.InputTokens
+		ev.OutputTokens = usage.OutputTokens
+		ev.CachedInputTokens = usage.CachedInputTokens
+	}
+	return ev
 }
 
 func (h *Handler) authenticate(r *http.Request) (*rbac.Identity, error) {

@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS meter_events (
     output_tokens UInt64,
     cached_input_tokens UInt64,
 
+    status_code UInt16 DEFAULT 0,
+
     pricing_context_snapshot String,
     currency String,
 
@@ -44,3 +46,6 @@ CREATE TABLE IF NOT EXISTS meter_events_hourly (
 ) ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(hour)
 ORDER BY (tenant_id, customer_id, hour, task_type, model, provider);
+
+-- 已有部署升级（幂等）：审计日志需按上游状态码过滤
+ALTER TABLE meter_events ADD COLUMN IF NOT EXISTS status_code UInt16 DEFAULT 0;

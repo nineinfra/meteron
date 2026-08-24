@@ -1,8 +1,9 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { session, clearSession, api, UnauthorizedError } from './api.js'
 import MonitorView from './components/MonitorView.vue'
 import ChatView from './components/ChatView.vue'
+import AdminView from './components/AdminView.vue'
 
 const connected = ref(false)
 const connStatus = ref('')
@@ -11,10 +12,11 @@ const gateKey = ref('')
 
 const state = reactive({ customers: [] })
 
-// ---- hash 路由：#/monitor（默认）| #/chat ----
+// ---- hash 路由：#/monitor（默认）| #/chat | #/admin ----
 const menus = [
   { key: 'monitor', label: '监控看板', icon: '◧' },
   { key: 'chat', label: '模型对话', icon: '✳' },
+  { key: 'admin', label: '管理', icon: '⚙' },
 ]
 const route = ref('monitor')
 
@@ -60,6 +62,8 @@ function onExpired() { // 子视图 401：会话失效
   disconnect()
 }
 
+const pageTitle = computed(() => menus.find((m) => m.key === route.value)?.label || '监控看板')
+
 onMounted(() => {
   applyHash()
   window.addEventListener('hashchange', applyHash)
@@ -104,12 +108,13 @@ onUnmounted(() => window.removeEventListener('hashchange', applyHash))
 
     <div class="main">
       <header class="topbar">
-        <span class="page-title">{{ route === 'chat' ? '模型对话' : '监控看板' }}</span>
+        <span class="page-title">{{ pageTitle }}</span>
         <span class="muted small">LLM 计量计费控制台</span>
       </header>
       <main class="content">
         <MonitorView v-show="route === 'monitor'" :customers="state.customers" @expired="onExpired" />
         <ChatView v-show="route === 'chat'" :customers="state.customers" />
+        <AdminView v-show="route === 'admin'" :customers="state.customers" @expired="onExpired" />
       </main>
     </div>
   </div>

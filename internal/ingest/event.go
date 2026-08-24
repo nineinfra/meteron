@@ -26,8 +26,9 @@ type MeterEvent struct {
 	TaskType                string             `json:"task_type"`
 	AgentID                 string             `json:"agent_id"`
 	InputTokens             uint64             `json:"input_tokens"`
-	OutputTokens            uint64            `json:"output_tokens"`
+	OutputTokens            uint64             `json:"output_tokens"`
 	CachedInputTokens       uint64             `json:"cached_input_tokens"`
+	StatusCode              uint16             `json:"status_code"` // 上游 HTTP 状态码（0=未知；网络失败记 502）
 	PricingContextSnapshot  *pricing.Snapshot  `json:"pricing_context_snapshot,omitempty"`
 	SnapshotRaw             string             `json:"-"`
 	Currency                string             `json:"currency"`

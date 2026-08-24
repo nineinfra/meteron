@@ -20,11 +20,13 @@ import (
 	"github.com/meteron/meteron/internal/billing"
 	"github.com/meteron/meteron/internal/config"
 	"github.com/meteron/meteron/internal/gateway"
+	"github.com/meteron/meteron/internal/health"
 	"github.com/meteron/meteron/internal/ingest"
 	"github.com/meteron/meteron/internal/ledger"
 	"github.com/meteron/meteron/internal/meter"
 	"github.com/meteron/meteron/internal/pricing"
 	"github.com/meteron/meteron/internal/provider"
+	"github.com/meteron/meteron/internal/ratelimit"
 	"github.com/meteron/meteron/internal/recon"
 	"github.com/meteron/meteron/internal/rbac"
 	"github.com/meteron/meteron/internal/router"
@@ -111,10 +113,24 @@ func main() {
 	billingWorker := billing.NewWorker(db, ch, rds, cfg, log)
 	reconWorker := recon.NewWorker(db, ch, rds, cfg, log)
 
+	// 渠道健康跟踪 + 双重限流（客户维度 / 上游 Provider 账号维度）
+	healthTracker := health.NewTracker(cfg.Health.Window, cfg.Health.ErrorRateThreshold, cfg.Health.MinSamples, log)
+	limiter := ratelimit.NewRedisLimiter(rds.Client)
+
 	gw := gateway.NewHandler(authSvc, ledgerSvc, ledgerStore, routerEngine, pricingEngine,
-		providers, producer, db, cfg, log)
+		providers, producer, db, cfg, log, healthTracker, limiter)
 	apiServer := api.NewServer(db, ch, authSvc, ledgerSvc, pricingEngine, producer,
-		billingWorker, cfg, log)
+		billingWorker, cfg, log, healthTracker, gw)
+
+	// 渠道主动探测（连通性检查，不消耗上游 token；interval<=0 时不启动）
+	probeTargets := make([]health.ProbeTarget, 0, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		probeTargets = append(probeTargets, health.ProbeTarget{Name: p.Name, BaseURL: p.BaseURL})
+	}
+	prober := health.NewProber(healthTracker, probeTargets, cfg.Health.ProbeInterval, 10*time.Second, log)
+	go func() {
+		prober.Run(ctx)
+	}()
 
 	// ---- HTTP 路由（API 与 Web 控制台分离端点）----
 	// API 端点（默认 :8080）：OpenAI 兼容网关 + 管理 API + 运维探针
