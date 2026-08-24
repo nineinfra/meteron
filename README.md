@@ -90,9 +90,16 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 > 图源文件为 [docs/data-flow.svg](docs/data-flow.svg)（纯文本 SVG，可直接编辑）。
 
-- **在线链路**只做轻量预算校验与转发（毫秒级）；计价、记账、出账全部异步，不阻塞请求。
-- **事件可靠性**：计量事件先落 PG Outbox 再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
-- **幂等保证**：事件按 `event_id` 去重，账单跑批可安全重跑，同一 `Idempotency-Key` 不重复计费。
+图中编号对应以下步骤（①–④ 同步完成、毫秒级；⑤–⑧ 全部异步，不阻塞请求）：
+
+- **① 请求接入**：应用以 OpenAI 兼容协议调用网关，只改 `base_url` 与鉴权头。
+- **② 预算预留**：网关按 `max_tokens` 估算金额，Redis+PG 两阶段预留；超额按策略阻断/告警/降级。
+- **③ 转发上游**：请求透明转发至 LLM Provider（OpenAI / Anthropic / GLM / 本地模型 / mock）。
+- **④ usage 嗅探**：边转发边解析响应中的 token 用量（含 SSE 流式），流式请求自动注入 `stream_options.include_usage`。
+- **⑤ 生成计量事件**：产出内嵌费率快照的 MeterEvent，先落 PG Outbox 持久化再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
+- **⑥ 计量聚合**：Sink 消费 Kafka 事件写入 ClickHouse 明细，并按小时桶预聚合。
+- **⑦ 出账**：BillingRun 按费率快照计价，生成账单与不可变账本流水；finalize 后不可变，跑批可安全重跑（同一 `Idempotency-Key` 不重复计费）。
+- **⑧ 对账**：对账 Worker 自动校准计量（ClickHouse）与账本（PG），差异自动生成 correction 红冲/补差流水。
 
 ## 生产级使用步骤
 
