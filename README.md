@@ -11,6 +11,10 @@
 | **精确计费** | 计量事件内嵌费率快照，费率改价不影响历史账单；支持阶梯计价与缓存 token 差异化定价 |
 | **账实一致** | 计量明细（ClickHouse）与账本流水（PostgreSQL）双轨自动对账，差异自动生成红冲/补差流水 |
 | **Web 控制台** | 内嵌可视化看板：token 用量趋势、模型用量明细、预算池余额、账单管理，零前端依赖 |
+| **密钥管控** | API Key 支持绑定客户、scope 授权、过期时间、IP 白名单（CIDR）、模型白名单与启停，最小权限分发 |
+| **渠道健康管理** | Provider 渠道错误率/延迟实时统计，超阈值自动降级切换 fallback，人工可恢复，指标暴露 Prometheus |
+| **双重限流** | 客户维度 RPM/TPM/并发 + 上游 Provider 账号维度并发保护（Redis 滑动窗口），防打爆上游 |
+| **审计与调试** | 请求全量审计日志多维查询（ClickHouse）；管理后台内置在线调试沙盒直发模型调用 |
 | **数据自持** | 全栈自托管（PG / ClickHouse / Redis / Kafka），多租户 + RBAC 隔离 |
 
 ## 快速开始（2 条命令）
@@ -32,12 +36,14 @@ API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对�
 | API/网关 | `:9080` | `/v1/chat/completions`、`/api/v1/*`、`/metrics`、`/healthz` |
 
 启动后浏览器打开 **`http://localhost:8080/`**，输入 API Key（开发环境默认
-`mk_meteron_bootstrap_dev_key`），左侧菜单两个界面：
+`mk_meteron_bootstrap_dev_key`），左侧菜单三个界面：
 
 - **监控看板**：KPI 卡片（请求数、输入/输出/缓存 tokens，24h/7d/30d 切换）、用量趋势图、
   按模型聚合的用量明细、预算池实时余额与进度条、账单管理（draft 一键定稿）
 - **模型对话**：与模型流式聊天（支持思考模型 reasoning 展示），每轮显示 token 用量，
   对话产生的用量实时进入监控看板
+- **管理**：API Key 管理（创建即见明文、IP/模型白名单、过期、启停）、渠道健康
+  （错误率/延迟/降级状态、人工恢复）、审计日志多维查询、在线调试沙盒
 
 控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），监控数据每 60 秒自动刷新。
 
@@ -66,20 +72,54 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 计费、预算、对账是同一套数据的后台加工：`/api/v1/budget-pools`（预算池）、`/api/v1/billing-runs`（出账跑批）、`/api/v1/reconciliation-runs`（对账结果）。
 
-## 工作原理
+## 系统架构
+
+### 对外 API 接口（集成视图）
+
+应用与外部系统通过以下接口将 Meteron 集成到自己的体系中（详细参数见 `scripts/verify.sh`）：
+
+```
+┌──────────────┐ OpenAI 兼容   ┌────────────────────────────────────────────────────┐
+│   用户应用    │ ────────────▶ │ POST /v1/chat/completions          LLM 代理网关   │
+│ (只改base_url)│               ├────────────────────────────────────────────────────┤
+└──────────────┘               │ Management API（REST，前缀 /api/v1）                │
+┌──────────────┐  REST         │  供给链  customers · billable-metrics · products   │
+│   管理系统    │ ────────────▶ │          rate-cards(+/{id}/rules) · contracts     │
+│ (供给/账单)   │               │  预算    budget-pools · budget-pools/{id}/balance │
+└──────────────┘               │          budget-reservations/{id}/confirm|release │
+┌──────────────┐  事件上报      │  用量    GET /usage · GET /usage/timeseries        │
+│  计量系统     │ ────────────▶ │  事件    POST /ingest/events                       │
+└──────────────┘               │  账单    bills(+/{id}/finalize|amend) ·           │
+┌──────────────┐  Prometheus   │          billing-runs · reconciliation-runs       │
+│  监控告警     │ ◀──────────── │  模型    GET /models                              │
+└──────────────┘               │  密钥    api-keys(POST/GET/PATCH启停/DELETE)      │
+┌──────────────┐  浏览器:8080   │  渠道    providers/health · /{name}/enable|disable │
+│  Web 控制台   │ ────────────▶  审计    GET /audit/events（多维过滤）              │
+└──────────────┘               │  调试    POST /debug/chat（沙盒直发）             │
+                               │  运维    GET /metrics · GET /healthz（免鉴权）     │
+                               └────────────────────────────────────────────────────┘
+```
+
+> 所有业务接口鉴权：`Authorization: Bearer <api-key>`；端点：API/网关 `:9080`，Web 控制台 `:8080`。
+
+### 内部数据流
 
 ```
 应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/本地模型/mock)
                        │ 预算预留(Redis+PG)      │ usage 嗅探(含 SSE 流式)
                        ▼                         ▼
-                    Kafka meter-events ──▶ ClickHouse 明细 + 小时预聚合
-                                                │
-                     BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
-                                                │
-                     对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
+                    MeterEvent(含费率快照) ──▶ PG Outbox ──▶ Kafka meter-events
+                                                     │ 先落盘再投递，崩溃不丢事件
+                                                     ▼
+                                        ClickHouse 明细 + 小时预聚合
+                                                     │
+                    BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
+                                                     │
+                    对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
 ```
 
 - **在线链路**只做轻量预算校验与转发（毫秒级）；计价、记账、出账全部异步，不阻塞请求。
+- **事件可靠性**：计量事件先落 PG Outbox 再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
 - **幂等保证**：事件按 `event_id` 去重，账单跑批可安全重跑，同一 `Idempotency-Key` 不重复计费。
 
 ## 生产级使用步骤
@@ -89,24 +129,44 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 ### 1. 密钥加固（必做）
 
 ```bash
-# 生成 32 字节 AES key（用于加密存储上游 LLM API Key）
+# 生成 32 字节主密钥（API Key 哈希的 HMAC pepper）
 openssl rand -hex 32
 ```
 
 在部署环境注入并重启（容器部署全部走环境变量，见 deploy/docker-compose.yml）：
 
 ```bash
-METERON_AES_KEY=<新key>                  # 加密上游 API Key，泄漏=上游账号被盗用
+METERON_AES_KEY=<新key>                  # API Key 单向哈希（HMAC-SHA256）的 pepper，泄漏=API Key 可被离线穷举
 METERON_BOOTSTRAP_API_KEY=<强随机值>     # 首次启动自动创建为 admin 权限密钥
 ```
 
+> **Key 存储**：`api_keys.key_hash` 保存 HMAC-SHA256 单向哈希（不落明文、不可逆），
+> 主密钥仅作为哈希 pepper；升级部署时存量引导密钥会在启动时自动迁移为单向哈希。
 > 引导 Key 即当前的管理入口（admin 全权限）。轮换方式：改环境变量重启会在原租户下
 > 自动新增一条 key 记录，旧 key 通过数据库禁用（`UPDATE api_keys SET deleted_at=NOW() WHERE ...`）。
-> 最小权限 API Key（按客户/按 scope 授权）为 V1 路线项，MVP 阶段统一走引导 Key。
+
+**最小权限密钥**（推荐替代直接分发引导 Key）：
+
+```bash
+# 创建绑定客户、30 天过期、仅网关调用、限 IP 与模型的密钥（明文仅此一次返回）
+curl -sX POST localhost:9080/api/v1/api-keys -H "$AUTH" -d '{
+  "customer_id": "<UUID>",
+  "scopes": ["gateway_invoke"],
+  "expire_at": "2026-09-23T00:00:00Z",
+  "ip_whitelist": ["10.0.0.0/8"],
+  "model_allow_list": ["gpt-4o-mini"]
+}'
+# 启停与吊销
+curl -sX PATCH localhost:9080/api/v1/api-keys/<ID>/enabled -H "$AUTH" -d '{"enabled":false}'
+curl -sX DELETE localhost:9080/api/v1/api-keys/<ID> -H "$AUTH"
+```
+
+密钥级管控在网关链路强制执行：IP 白名单 fail-closed、模型白名单校验最终转发模型
+（含 fallback 调整后）、过期/禁用即时失效。
 
 ### 2. 接入真实 Provider
 
-`config.yaml` 配置后重启（`api_key` 会以 AES 加密落库）：
+`config.yaml` 配置后重启（Provider 的 `api_key` 仅存在于配置/环境变量中，不落库）：
 
 ```yaml
 providers:
@@ -150,13 +210,28 @@ curl -sX POST localhost:9080/api/v1/billing-runs -H "$AUTH" \
 curl -sX POST localhost:9080/api/v1/bills/<BILL_ID>/finalize -H "$AUTH"      # 定稿（不可再改）
 ```
 
-### 5. 开启自动化调度
+### 5. 开启自动化调度与保护性限流
 
 ```bash
 METERON_BILLING_INTERVAL=24h        # 自动出账（默认 0=手动触发）
 METERON_RECON_LIGHT_INTERVAL=1h     # 小时级轻量对账（计量 vs 预聚合）
 METERON_RECON_DEEP_INTERVAL=24h     # 每日深度对账（重算金额 vs 账本，差异自动补差）
+
+# 双重限流（全部 0=不限制；Redis 滑动窗口，限流器故障 fail-open 放行）
+METERON_RATE_LIMIT_CUSTOMER_RPM=60          # 客户每分钟最大请求数
+METERON_RATE_LIMIT_CUSTOMER_TPM=100000      # 客户每分钟最大 token 数
+METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT=10   # 客户最大并发
+METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT=20   # 上游渠道单账号最大并发（防打爆上游）
+
+# 渠道健康探测与自动降级
+METERON_HEALTH_PROBE_INTERVAL=60s     # 主动探测间隔（GET base_url，0=关闭）
+METERON_HEALTH_WINDOW=5m              # 错误率统计滑动窗口
+METERON_HEALTH_ERROR_RATE_THRESHOLD=0.5  # 自动禁用阈值（含真实流量与探测样本）
+METERON_HEALTH_MIN_SAMPLES=10         # 触发降级最小样本数（防小样本误杀）
 ```
+
+渠道错误率超阈值自动禁用，路由引擎切换 fallback（均不可用则拒绝并释放预留）；
+人工恢复 `POST /api/v1/providers/{name}/enable`（重置统计重新观察）。
 
 ### 6. 接入监控告警
 
@@ -168,6 +243,8 @@ METERON_RECON_DEEP_INTERVAL=24h     # 每日深度对账（重算金额 vs 账�
 | `budget_cache_drift_micros` | Redis-PG 预算缓存漂移 | 绝对值持续增长 |
 | `budget_reservation_expired_total` | 过期预留（SSE 断连/超时） | 增速突增 |
 | `gateway_overhead_seconds` | 网关附加延迟 | p99 > 100ms |
+| `provider_health_error_rate` | 渠道滑动窗口错误率 | > 0.3 持续 2 个周期 |
+| `provider_health_avg_latency_seconds` | 渠道平均延迟 | 环比突增 3 倍 |
 
 健康检查：`GET /healthz`。
 
@@ -181,7 +258,10 @@ METERON_RECON_DEEP_INTERVAL=24h     # 每日深度对账（重算金额 vs 账�
 
 ```bash
 go build ./...   # 构建
-go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义）
+go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递
+                 #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
 ```
 
-模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ui`（Web 控制台）。
+模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ingest`（事件与 outbox 投递）、`internal/health`（渠道健康）、`internal/ratelimit`（双重限流）、`internal/ui`（Web 控制台）。
+
+详细评审报告见 [docs/code-review.md](docs/code-review.md)。

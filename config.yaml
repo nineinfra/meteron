@@ -13,10 +13,12 @@ kafka_brokers:
 kafka_topic: "meteron.meter-events"
 redis_addr: "localhost:6379"
 
-# 32字节 hex（64字符）。生产环境务必更换并妥善保管
+# 32字节 hex（64字符）。API Key 哈希（HMAC-SHA256）的 pepper，生产环境务必更换并妥善保管
 aes_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 # 首次启动引导 API Key（明文，仅初始化用；生产环境启动后应轮换）
 bootstrap_api_key: "mk_meteron_bootstrap_dev_key"
+# 本地开发样例显式豁免内置默认密钥（源码公开值，生产部署必须替换上面两项并删除本行）
+insecure_defaults: true
 
 providers:
   # 默认模型：本地 Ollama 的 qwen3.5:9b（先 ollama pull qwen3.5:9b）
@@ -55,3 +57,20 @@ business:
   billing_interval: 0              # BillingRun 自动调度（0=仅手动触发）
   recon_light_interval: 1h         # 小时轻量对账
   recon_deep_interval: 24h         # 每日深度对账
+
+# 双重限流（参考 sub2api）：客户维度 RPM/TPM/并发 + 上游 Provider 账号维度并发。
+# 全部 0 = 不限制。Redis 滑动窗口实现；限流器故障时 fail-open 放行。
+rate_limit:
+  customer_rpm: 0            # 客户每分钟最大请求数
+  customer_tpm: 0            # 客户每分钟最大 token 数（按输入估算+max_tokens）
+  customer_max_concurrent: 0 # 客户最大并发请求数
+  provider_max_concurrent: 0 # 上游渠道单账号最大并发（防止打爆上游触发限流）
+
+# 渠道健康探测与自动降级（参考 new-api 渠道管理）。
+# 窗口内错误率超阈值且样本数达标 → 自动禁用（路由切换 fallback，均不可用则拒绝）；
+# 人工恢复：POST /api/v1/providers/{name}/enable（重置统计重新观察）。
+health:
+  probe_interval: 60s        # 主动探测间隔（GET base_url 连通性检查，不耗 token；0=关闭）
+  window: 5m                 # 错误率统计滑动窗口
+  error_rate_threshold: 0.5  # 自动禁用阈值（0~1，含真实流量与探测样本）
+  min_samples: 10            # 触发自动禁用的最小样本数（防小样本误杀）

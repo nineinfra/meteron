@@ -38,6 +38,9 @@ func NewPG(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 }
 
 // MigratePG 执行内嵌迁移脚本（幂等：脚本内部使用 IF NOT EXISTS / CREATE TYPE 前置删除兼容）。
+//
+// 命名约定：PG 迁移脚本 NNN_*_pg.sql（如 001_pg_init.sql / 003_meter_outbox_pg.sql）；
+// ClickHouse 脚本（NNN_*_clickhouse*.sql）由 NewClickHouse 单独应用，此处跳过。
 func MigratePG(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -51,13 +54,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	if err != nil {
 		return err
 	}
-	var names []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".sql") && strings.HasPrefix(e.Name(), "001") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
+	names := pgMigrationNames(entries)
 
 	for _, name := range names {
 		var exists bool
@@ -100,6 +97,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		}
 	}
 	return nil
+}
+
+// pgMigrationNames 筛选并排序 PG 迁移脚本（含 "_pg" 的 .sql 文件）。
+// 修复点：原先硬编码 HasPrefix("001")，导致新增迁移脚本永远不会被执行。
+func pgMigrationNames(entries []fs.DirEntry) []string {
+	var names []string
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasSuffix(n, ".sql") && strings.Contains(n, "_pg") {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // splitSQL 粗粒度按分号拆分（脚本内无函数体/存储过程，安全）。

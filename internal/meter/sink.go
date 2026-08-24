@@ -136,6 +136,7 @@ func (w *SinkWorker) writeEvents(ctx context.Context, events []*ingest.MeterEven
 			ev.InputTokens,
 			ev.OutputTokens,
 			ev.CachedInputTokens,
+			ev.StatusCode,
 			snapshotJSON,
 			ev.Currency,
 			metadata,

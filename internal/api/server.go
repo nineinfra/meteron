@@ -17,6 +17,7 @@ import (
 	"github.com/meteron/meteron/internal/billing"
 	"github.com/meteron/meteron/internal/common"
 	"github.com/meteron/meteron/internal/config"
+	"github.com/meteron/meteron/internal/health"
 	"github.com/meteron/meteron/internal/ingest"
 	"github.com/meteron/meteron/internal/ledger"
 	"github.com/meteron/meteron/internal/pricing"
@@ -36,6 +37,8 @@ type Server struct {
 	billing   *billing.Worker
 	cfg       *config.Config
 	log       *slog.Logger
+	health    *health.Tracker // 渠道健康（nil=未启用，端点返回 NOT_IMPLEMENTED）
+	gateway   http.Handler    // 网关 Handler（调试沙盒内部转发用）
 }
 
 func NewServer(
@@ -48,11 +51,14 @@ func NewServer(
 	billingWorker *billing.Worker,
 	cfg *config.Config,
 	log *slog.Logger,
+	healthTracker *health.Tracker,
+	gateway http.Handler,
 ) *Server {
 	return &Server{
 		db: db, ch: ch, auth: auth, ledgerSvc: ledgerSvc,
 		pricing: pricingEngine, producer: producer, billing: billingWorker,
 		cfg: cfg, log: log,
+		health: healthTracker, gateway: gateway,
 	}
 }
 
@@ -100,6 +106,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/billing-runs", s.triggerBillingRun)
 	mux.HandleFunc("GET /api/v1/reconciliation-runs", s.listReconciliationRuns)
 
+	// API Key 管理（IP/模型白名单、过期、绑定客户、启停）
+	mux.HandleFunc("POST /api/v1/api-keys", s.createAPIKey)
+	mux.HandleFunc("GET /api/v1/api-keys", s.listAPIKeys)
+	mux.HandleFunc("PATCH /api/v1/api-keys/{id}/enabled", s.setAPIKeyEnabled)
+	mux.HandleFunc("DELETE /api/v1/api-keys/{id}", s.deleteAPIKey)
+
+	// Provider 渠道健康（探测指标、自动降级状态、人工恢复/禁用）
+	mux.HandleFunc("GET /api/v1/providers/health", s.providerHealth)
+	mux.HandleFunc("POST /api/v1/providers/{name}/enable", s.enableProvider)
+	mux.HandleFunc("POST /api/v1/providers/{name}/disable", s.disableProvider)
+
+	// 审计日志查询（ClickHouse 原始请求事件多维过滤）
+	mux.HandleFunc("GET /api/v1/audit/events", s.listAuditEvents)
+
+	// 在线调试沙盒（管理后台直发模型调用，校验路由/定价/权限配置）
+	mux.HandleFunc("POST /api/v1/debug/chat", s.debugChat)
+
 	return s.authMiddleware(mux)
 }
 
@@ -114,6 +137,16 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		ident, err := s.auth.Authenticate(r.Context(), token)
 		if err != nil {
 			writeErr(w, common.ErrUnauthorized.Wrap(err))
+			return
+		}
+		// IP 白名单：管理面与网关一致强制——否则配置了"仅内网 IP"的密钥
+		// 泄漏后仍可从公网调用管理 API（含密钥管理、账单、调试沙盒），第二道防线失效。
+		var trustedProxies []string
+		if s.cfg != nil {
+			trustedProxies = s.cfg.Security.TrustedProxies
+		}
+		if !rbac.IPAllowed(ident.IPWhitelist, rbac.ClientIP(r, trustedProxies)) {
+			writeErr(w, common.ErrIPNotAllowed.Wrap(errors.New("source ip not in key whitelist")))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), ident)))

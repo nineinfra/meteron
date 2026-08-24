@@ -21,6 +21,12 @@ const (
 	CodeUpstreamError                  = 1009 // UPSTREAM_ERROR 上游 LLM 返回错误
 	CodeBadRequest                     = 1010 // BAD_REQUEST 参数错误
 	CodeNotImplemented                 = 1011 // NOT_IMPLEMENTED MVP 未实现
+	CodeIPNotAllowed                   = 1012 // IP_NOT_ALLOWED 来源 IP 不在密钥白名单
+	CodeModelNotAllowed                = 1013 // MODEL_NOT_ALLOWED 模型不在密钥白名单
+	CodeRateLimited                    = 1014 // RATE_LIMITED 触发速率限制（RPM/TPM）
+	CodeConcurrencyLimited             = 1015 // CONCURRENCY_LIMITED 触发并发限制
+	CodeKeyDisabled                    = 1016 // KEY_DISABLED 密钥已禁用或过期
+	CodeCustomerNotAllowed             = 1017 // CUSTOMER_NOT_ALLOWED 请求客户与密钥绑定不符
 	CodeInternal                       = 2001 // INTERNAL_ERROR 内部系统异常
 )
 
@@ -61,6 +67,12 @@ var (
 	ErrUpstream                     = NewBiz(CodeUpstreamError, "UPSTREAM_ERROR", http.StatusBadGateway)
 	ErrBadRequest                   = NewBiz(CodeBadRequest, "BAD_REQUEST", http.StatusBadRequest)
 	ErrNotImplemented               = NewBiz(CodeNotImplemented, "NOT_IMPLEMENTED", http.StatusNotImplemented)
+	ErrIPNotAllowed                 = NewBiz(CodeIPNotAllowed, "IP_NOT_ALLOWED", http.StatusForbidden)
+	ErrModelNotAllowed              = NewBiz(CodeModelNotAllowed, "MODEL_NOT_ALLOWED", http.StatusForbidden)
+	ErrRateLimited                  = NewBiz(CodeRateLimited, "RATE_LIMITED", http.StatusTooManyRequests)
+	ErrConcurrencyLimited           = NewBiz(CodeConcurrencyLimited, "CONCURRENCY_LIMITED", http.StatusTooManyRequests)
+	ErrKeyDisabled                  = NewBiz(CodeKeyDisabled, "KEY_DISABLED", http.StatusUnauthorized)
+	ErrCustomerNotAllowed           = NewBiz(CodeCustomerNotAllowed, "CUSTOMER_NOT_ALLOWED", http.StatusForbidden)
 	ErrInternal                     = NewBiz(CodeInternal, "INTERNAL_ERROR", http.StatusInternalServerError)
 )
 
