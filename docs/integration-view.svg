@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="544" viewBox="0 0 980 544" font-family="-apple-system,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <title>Meteron 对外 API 接口（集成视图）</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <rect width="980" height="544" fill="#FFFFFF"/>
+
+  <!-- ===== 左侧：外部系统 ===== -->
+  <g>
+    <rect x="24" y="40" width="168" height="64" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+    <text x="108" y="68" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">用户应用</text>
+    <text x="108" y="88" text-anchor="middle" font-size="12" fill="#6B7280">(只改 base_url)</text>
+  </g>
+  <g>
+    <rect x="24" y="140" width="168" height="64" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+    <text x="108" y="168" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">管理系统</text>
+    <text x="108" y="188" text-anchor="middle" font-size="12" fill="#6B7280">(供给/账单)</text>
+  </g>
+  <g>
+    <rect x="24" y="240" width="168" height="64" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+    <text x="108" y="277" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">计量系统</text>
+  </g>
+  <g>
+    <rect x="24" y="340" width="168" height="64" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+    <text x="108" y="377" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">监控告警</text>
+  </g>
+  <g>
+    <rect x="24" y="440" width="168" height="64" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+    <text x="108" y="477" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">Web 控制台</text>
+  </g>
+
+  <!-- ===== 箭头 ===== -->
+  <g stroke="#6B7280" stroke-width="1.5" fill="none">
+    <line x1="192" y1="72" x2="293" y2="72" marker-end="url(#arrow)"/>
+    <line x1="192" y1="172" x2="293" y2="172" marker-end="url(#arrow)"/>
+    <line x1="192" y1="272" x2="293" y2="272" marker-end="url(#arrow)"/>
+    <line x1="293" y1="372" x2="193" y2="372" marker-end="url(#arrow)"/>
+    <line x1="192" y1="472" x2="293" y2="472" marker-end="url(#arrow)"/>
+  </g>
+  <g font-size="12" fill="#6B7280" text-anchor="middle">
+    <text x="243" y="61">OpenAI 兼容</text>
+    <text x="243" y="161">REST</text>
+    <text x="243" y="261">事件上报</text>
+    <text x="243" y="361">Prometheus</text>
+    <text x="243" y="461">浏览器 :8080</text>
+  </g>
+
+  <!-- ===== 右侧：Meteron 服务 ===== -->
+  <!-- 网关端点头 -->
+  <path d="M 300 88 V 50 Q 300 40 310 40 H 946 Q 956 40 956 50 V 88 Z" fill="#EEF2FF"/>
+  <text x="320" y="70" font-size="15" font-weight="600" fill="#4338CA" font-family="ui-monospace,'SF Mono','Cascadia Code',Consolas,monospace">POST /v1/chat/completions</text>
+  <rect x="824" y="52" width="116" height="26" rx="13" fill="#C7D2FE"/>
+  <text x="882" y="69" text-anchor="middle" font-size="12" font-weight="600" fill="#3730A3">LLM 代理网关</text>
+
+  <!-- Management API 小节头 -->
+  <rect x="300" y="88" width="656" height="30" fill="#F8FAFC"/>
+  <text x="316" y="107" font-size="13"><tspan font-weight="600" fill="#1F2937">Management API</tspan><tspan fill="#6B7280">（REST，前缀 /api/v1）</tspan></text>
+
+  <!-- 表格行（隔行条纹） -->
+  <g>
+    <rect x="300" y="118" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="170" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="222" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="274" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="326" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="378" width="656" height="26" fill="#F8FAFC"/>
+    <rect x="300" y="430" width="656" height="26" fill="#F8FAFC"/>
+  </g>
+  <g font-size="13" fill="#1F2937" font-weight="500">
+    <text x="316" y="135">供给链</text>
+    <text x="316" y="187">预算</text>
+    <text x="316" y="239">用量</text>
+    <text x="316" y="265">事件</text>
+    <text x="316" y="291">账单</text>
+    <text x="316" y="343">模型</text>
+    <text x="316" y="369">密钥</text>
+    <text x="316" y="395">渠道</text>
+    <text x="316" y="421">审计</text>
+    <text x="316" y="447">调试</text>
+    <text x="316" y="473">运维</text>
+  </g>
+  <g font-size="13" fill="#374151" font-family="ui-monospace,'SF Mono','Cascadia Code',Consolas,monospace">
+    <text x="396" y="135">customers · billable-metrics · products</text>
+    <text x="396" y="161">rate-cards(+/{id}/rules) · contracts</text>
+    <text x="396" y="187">budget-pools · budget-pools/{id}/balance</text>
+    <text x="396" y="213">budget-reservations/{id}/confirm|release</text>
+    <text x="396" y="239">GET /usage · GET /usage/timeseries</text>
+    <text x="396" y="265">POST /ingest/events</text>
+    <text x="396" y="291">bills(+/{id}/finalize|amend) ·</text>
+    <text x="396" y="317">billing-runs · reconciliation-runs</text>
+    <text x="396" y="343">GET /models</text>
+    <text x="396" y="369">api-keys(POST/GET/PATCH启停/DELETE)</text>
+    <text x="396" y="395">providers/health · /{name}/enable|disable</text>
+    <text x="396" y="421">GET /audit/events（多维过滤）</text>
+    <text x="396" y="447">POST /debug/chat（沙盒直发）</text>
+    <text x="396" y="473">GET /metrics · GET /healthz（免鉴权）</text>
+  </g>
+
+  <!-- 分隔线与外框（最后绘制盖住填充边缘） -->
+  <line x1="300" y1="88" x2="956" y2="88" stroke="#C7D2FE" stroke-width="1"/>
+  <rect x="300" y="40" width="656" height="464" rx="10" fill="none" stroke="#94A3B8" stroke-width="1.5"/>
+</svg>
