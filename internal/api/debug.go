@@ -41,7 +41,8 @@ func (s *Server) debugChat(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// 透传鉴权与网关元数据头（X-Meteron-*），与真实调用方一致
-	for _, h := range []string{"Authorization", headerCustomerID, headerTaskType, headerAgentID} {
+	for _, h := range []string{"Authorization", headerCustomerID, headerTaskType, headerAgentID,
+		"X-Meteron-Provider", "X-Meteron-Quality"} {
 		if v := r.Header.Get(h); v != "" {
 			req.Header.Set(h, v)
 		}

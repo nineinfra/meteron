@@ -38,6 +38,11 @@ const (
 	headerTaskType   = "X-Meteron-Task-Type"
 	headerAgentID    = "X-Meteron-Agent-ID"
 	headerIdemKey    = "X-Idempotency-Key"
+	// 应用侧渠道选择：显式锁定上游渠道（跳过路由规则）；
+	// 质量要求（auto 模式成本路由信号）：low/medium/high → economy/standard/premium
+	headerProvider   = "X-Meteron-Provider"
+	headerQuality    = "X-Meteron-Quality"
+	modelAuto        = "auto"
 
 	maxBodyBytes = 10 << 20 // 10MB
 )
@@ -178,10 +183,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		availRatio = h.poolAvailRatio(ctx, pool)
 	}
 
-	route, err := h.router.Resolve(ctx, ident.TenantID, taskType, chatReq.Model, availRatio)
-	if err != nil {
-		writeErr(w, common.FromErr(err))
-		return
+	// 5.5 路由决策（三模式）：
+	//   a. 显式 X-Meteron-Provider：应用锁定渠道（跳过路由规则；model=auto 时取该渠道默认模型）
+	//   b. model=auto：Meteron 按请求复杂度自动路由（成本分级策略，见 router.ResolveAuto）
+	//   c. 具体模型：现有 route_rules / 模型反查
+	requestedProvider := r.Header.Get(headerProvider)
+	isAuto := strings.EqualFold(chatReq.Model, modelAuto)
+	var route *router.RouteResult
+	if requestedProvider != "" {
+		if _, ok := h.providers.Get(requestedProvider); !ok {
+			writeErr(w, common.ErrBadRequest.Wrap(fmt.Errorf("unknown provider %q", requestedProvider)))
+			return
+		}
+		model := chatReq.Model
+		if isAuto {
+			m, ok := h.providers.DefaultModelForProvider(requestedProvider)
+			if !ok {
+				writeErr(w, common.ErrBadRequest.Wrap(fmt.Errorf("provider %q has no models", requestedProvider)))
+				return
+			}
+			model = m
+		}
+		route = &router.RouteResult{Provider: requestedProvider, Model: model}
+	} else if isAuto {
+		route, err = h.router.ResolveAuto(ctx, ident.TenantID, taskType, h.buildProfile(r, &chatReq), availRatio)
+		if err != nil {
+			writeErr(w, common.FromErr(err))
+			return
+		}
+	} else {
+		route, err = h.router.Resolve(ctx, ident.TenantID, taskType, chatReq.Model, availRatio)
+		if err != nil {
+			writeErr(w, common.FromErr(err))
+			return
+		}
 	}
 	// 无路由规则时按模型反查 provider
 	if route.Provider == "" {
@@ -412,6 +447,7 @@ type chatRequest struct {
 	Messages    []chatMessage   `json:"messages"`
 	MaxTokens   *int            `json:"max_tokens"`
 	Stream      bool            `json:"stream"`
+	Tools       json.RawMessage `json:"tools"` // 工具调用（auto 路由复杂度信号：tools 非空 → premium）
 }
 
 // maxTokensLimit max_tokens 合法上限：拒绝天文数字（如 MaxInt64 会让
@@ -449,6 +485,47 @@ func rewriteBodyModel(body []byte, model string) ([]byte, error) {
 	}
 	m["model"] = json.RawMessage(mb)
 	return json.Marshal(m)
+}
+
+// buildProfile 构建 auto 路由请求画像（复杂度评估信号）：
+// 显式 X-Meteron-Quality 头 > 启发式（图片/工具调用/输入规模）。
+func (h *Handler) buildProfile(r *http.Request, req *chatRequest) router.RequestProfile {
+	p := router.RequestProfile{
+		Quality: strings.ToLower(strings.TrimSpace(r.Header.Get(headerQuality))),
+	}
+	chars := 0
+	for _, m := range req.Messages {
+		chars += m.textLen()
+		if contentHasImage(m.Content) {
+			p.HasImages = true
+		}
+	}
+	cpt := h.cfg.Business.EstimateCharsPerToken
+	if cpt <= 0 {
+		cpt = 4
+	}
+	p.InputTokens = uint64(chars/cpt + 1)
+	// tools 非空判断：null / 空数组均视为无工具
+	if t := string(req.Tools); t != "" && t != "null" && t != "[]" {
+		p.HasTools = true
+	}
+	return p
+}
+
+// contentHasImage 检测多模态消息是否含图片（OpenAI content parts 的 type=image_url）。
+func contentHasImage(content json.RawMessage) bool {
+	var parts []struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return false
+	}
+	for _, p := range parts {
+		if p.Type == "image_url" {
+			return true
+		}
+	}
+	return false
 }
 
 type chatMessage struct {

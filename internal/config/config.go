@@ -16,11 +16,12 @@ import (
 )
 
 type ProviderConfig struct {
-	Name    string   `yaml:"name"`    // provider 名称，route_rules.target_provider 引用
-	Type    string   `yaml:"type"`    // openai | openai-compatible | local | anthropic | mock
-	BaseURL string   `yaml:"base_url"`
-	APIKey  string   `yaml:"api_key"` // 支持 ${ENV_VAR} 展开；local 类型可留空
-	Models  []string `yaml:"models"`  // 该 provider 承载的模型列表（无路由规则时按 model 反查 provider）
+	Name     string   `yaml:"name"`      // provider 名称，route_rules.target_provider 引用
+	Type     string   `yaml:"type"`      // openai | openai-compatible | local | anthropic | mock
+	BaseURL  string   `yaml:"base_url"`
+	APIKey   string   `yaml:"api_key"`   // 支持 ${ENV_VAR} 展开；local 类型可留空
+	Models   []string `yaml:"models"`    // 该 provider 承载的模型列表（无路由规则时按 model 反查 provider）
+	CostTier string   `yaml:"cost_tier"` // economy | standard | premium：成本分级（auto 路由按此分级选择渠道）
 }
 
 // RateLimit 双重限流配置（参考 sub2api：客户维度 + 上游 Provider 账号维度）。
@@ -127,9 +128,9 @@ func Default() *Config {
 	c.Providers = []ProviderConfig{
 		// 默认模型：本机 Ollama 的 qwen3.5:9b（OpenAI 兼容端点，api_key 留空）。
 		// 容器内经 host.docker.internal 访问宿主机 Ollama；宿主机直跑时由 config.yaml 覆盖为 localhost。
-		{Name: "ollama", Type: "local", BaseURL: "http://host.docker.internal:11434/v1", Models: []string{"qwen3.5:9b"}},
+		{Name: "ollama", Type: "local", BaseURL: "http://host.docker.internal:11434/v1", Models: []string{"qwen3.5:9b"}, CostTier: "economy"},
 		// mock：无外部依赖的验证用 provider（verify.sh 使用）
-		{Name: "mock", Type: "mock", BaseURL: "", APIKey: "", Models: []string{"mock-chat", "mock-cheap"}},
+		{Name: "mock", Type: "mock", BaseURL: "", APIKey: "", Models: []string{"mock-chat", "mock-cheap"}, CostTier: "economy"},
 	}
 	return c
 }
@@ -299,6 +300,19 @@ func validate(c *Config) error {
 	if c.RateLimit.CustomerRPM < 0 || c.RateLimit.CustomerTPM < 0 ||
 		c.RateLimit.CustomerMaxConcurr < 0 || c.RateLimit.ProviderMaxConcurr < 0 {
 		return fmt.Errorf("rate_limit 配置不允许负值")
+	}
+	// cost_tier 只允许三个已知分级 + 空值（未分级渠道不参与 auto 成本路由）
+	seen := map[string]bool{}
+	for _, p := range c.Providers {
+		switch p.CostTier {
+		case "", "economy", "standard", "premium":
+		default:
+			return fmt.Errorf("provider %s: cost_tier 非法值 %q（允许 economy/standard/premium）", p.Name, p.CostTier)
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("provider 名称重复: %s", p.Name)
+		}
+		seen[p.Name] = true
 	}
 	return nil
 }
