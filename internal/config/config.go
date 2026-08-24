@@ -44,7 +44,7 @@ type Config struct {
 	KafkaBrokers  []string         `yaml:"kafka_brokers"`
 	KafkaTopic    string           `yaml:"kafka_topic"`
 	RedisAddr     string           `yaml:"redis_addr"`
-	AESKey        string           `yaml:"aes_key"`           // 32字节 hex，API Key 加密主密钥
+	AESKey        string           `yaml:"aes_key"`           // 32字节 hex，API Key 哈希（HMAC-SHA256）的 pepper
 	BootstrapKey  string           `yaml:"bootstrap_api_key"` // 首次启动引导 API Key（明文，仅用于初始化）
 	Providers     []ProviderConfig `yaml:"providers"`
 	Business      Business         `yaml:"business"`

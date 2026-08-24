@@ -66,20 +66,52 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 计费、预算、对账是同一套数据的后台加工：`/api/v1/budget-pools`（预算池）、`/api/v1/billing-runs`（出账跑批）、`/api/v1/reconciliation-runs`（对账结果）。
 
-## 工作原理
+## 系统架构
+
+### 对外 API 接口（集成视图）
+
+应用与外部系统通过以下接口将 Meteron 集成到自己的体系中（详细参数见 `scripts/verify.sh`）：
+
+```
+┌──────────────┐ OpenAI 兼容   ┌────────────────────────────────────────────────────┐
+│   用户应用    │ ────────────▶ │ POST /v1/chat/completions          LLM 代理网关   │
+│ (只改base_url)│               ├────────────────────────────────────────────────────┤
+└──────────────┘               │ Management API（REST，前缀 /api/v1）                │
+┌──────────────┐  REST         │  供给链  customers · billable-metrics · products   │
+│   管理系统    │ ────────────▶ │          rate-cards(+/{id}/rules) · contracts     │
+│ (供给/账单)   │               │  预算    budget-pools · budget-pools/{id}/balance │
+└──────────────┘               │          budget-reservations/{id}/confirm|release │
+┌──────────────┐  事件上报      │  用量    GET /usage · GET /usage/timeseries        │
+│  计量系统     │ ────────────▶ │  事件    POST /ingest/events                       │
+└──────────────┘               │  账单    bills(+/{id}/finalize|amend) ·           │
+┌──────────────┐  Prometheus   │          billing-runs · reconciliation-runs       │
+│  监控告警     │ ◀──────────── │  模型    GET /models                              │
+└──────────────┘               │  运维    GET /metrics · GET /healthz（免鉴权）     │
+┌──────────────┐  浏览器:8080   └────────────────────────────────────────────────────┘
+│  Web 控制台   │ ────────────▶  监控看板 / 模型对话（内嵌静态资源，反代同源调用 API）
+└──────────────┘
+```
+
+> 所有业务接口鉴权：`Authorization: Bearer <api-key>`；端点：API/网关 `:9080`，Web 控制台 `:8080`。
+
+### 内部数据流
 
 ```
 应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/本地模型/mock)
                        │ 预算预留(Redis+PG)      │ usage 嗅探(含 SSE 流式)
                        ▼                         ▼
-                    Kafka meter-events ──▶ ClickHouse 明细 + 小时预聚合
-                                                │
-                     BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
-                                                │
-                     对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
+                    MeterEvent(含费率快照) ──▶ PG Outbox ──▶ Kafka meter-events
+                                                     │ 先落盘再投递，崩溃不丢事件
+                                                     ▼
+                                        ClickHouse 明细 + 小时预聚合
+                                                     │
+                    BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
+                                                     │
+                    对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
 ```
 
 - **在线链路**只做轻量预算校验与转发（毫秒级）；计价、记账、出账全部异步，不阻塞请求。
+- **事件可靠性**：计量事件先落 PG Outbox 再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
 - **幂等保证**：事件按 `event_id` 去重，账单跑批可安全重跑，同一 `Idempotency-Key` 不重复计费。
 
 ## 生产级使用步骤
@@ -89,24 +121,26 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 ### 1. 密钥加固（必做）
 
 ```bash
-# 生成 32 字节 AES key（用于加密存储上游 LLM API Key）
+# 生成 32 字节主密钥（API Key 哈希的 HMAC pepper）
 openssl rand -hex 32
 ```
 
 在部署环境注入并重启（容器部署全部走环境变量，见 deploy/docker-compose.yml）：
 
 ```bash
-METERON_AES_KEY=<新key>                  # 加密上游 API Key，泄漏=上游账号被盗用
+METERON_AES_KEY=<新key>                  # API Key 单向哈希（HMAC-SHA256）的 pepper，泄漏=API Key 可被离线穷举
 METERON_BOOTSTRAP_API_KEY=<强随机值>     # 首次启动自动创建为 admin 权限密钥
 ```
 
+> **Key 存储**：`api_keys.key_hash` 保存 HMAC-SHA256 单向哈希（不落明文、不可逆），
+> 主密钥仅作为哈希 pepper；升级部署时存量引导密钥会在启动时自动迁移为单向哈希。
 > 引导 Key 即当前的管理入口（admin 全权限）。轮换方式：改环境变量重启会在原租户下
 > 自动新增一条 key 记录，旧 key 通过数据库禁用（`UPDATE api_keys SET deleted_at=NOW() WHERE ...`）。
 > 最小权限 API Key（按客户/按 scope 授权）为 V1 路线项，MVP 阶段统一走引导 Key。
 
 ### 2. 接入真实 Provider
 
-`config.yaml` 配置后重启（`api_key` 会以 AES 加密落库）：
+`config.yaml` 配置后重启（Provider 的 `api_key` 仅存在于配置/环境变量中，不落库）：
 
 ```yaml
 providers:
@@ -181,7 +215,9 @@ METERON_RECON_DEEP_INTERVAL=24h     # 每日深度对账（重算金额 vs 账�
 
 ```bash
 go build ./...   # 构建
-go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义）
+go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递 / API Key 哈希）
 ```
 
-模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ui`（Web 控制台）。
+模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ingest`（事件与 outbox 投递）、`internal/ui`（Web 控制台）。
+
+详细评审报告见 [docs/code-review.md](docs/code-review.md)。

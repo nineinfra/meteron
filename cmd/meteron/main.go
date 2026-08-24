@@ -105,7 +105,7 @@ func main() {
 		log.Error("init provider registry failed", "err", err)
 		os.Exit(1)
 	}
-	producer := ingest.NewProducer(kafkaWriter, log)
+	producer := ingest.NewProducer(kafkaWriter, ingest.NewPGOutboxStore(db), log)
 	defer producer.Close()
 
 	billingWorker := billing.NewWorker(db, ch, rds, cfg, log)

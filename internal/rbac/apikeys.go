@@ -1,6 +1,7 @@
-// Package rbac 提供 API Key 的确定性 AES 加密存储与鉴权。
-// key_hash 列保存 AES-GCM 确定性加密结果（同一明文+主密钥 => 同一密文），
-// 从而支持"加密后等值查找"，全程不落明文。
+// Package rbac 提供 API Key 的单向哈希存储与鉴权。
+// key_hash 列保存 HMAC-SHA256(主密钥, 明文) 的 hex 结果：
+// 单向不可逆——即使数据库与主密钥（AES key）同时泄漏，也无法还原密钥明文；
+// 同一明文+主密钥 => 同一哈希，支持等值查找，全程不落明文。
 package rbac
 
 import (
@@ -43,9 +44,9 @@ func (i *Identity) HasScope(s string) bool {
 }
 
 type Service struct {
-	db      *pgxpool.Pool
-	aesGCM  cipher.AEAD
-	hmacKey []byte
+	db        *pgxpool.Pool
+	hmacKey   []byte
+	legacyGCM cipher.AEAD // 仅用于 Bootstrap 升级 v1 确定性加密的存量 key_hash
 }
 
 func NewService(db *pgxpool.Pool, aesKeyHex string) (*Service, error) {
@@ -61,15 +62,26 @@ func NewService(db *pgxpool.Pool, aesKeyHex string) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{db: db, aesGCM: gcm, hmacKey: key}, nil
+	return &Service{db: db, hmacKey: key, legacyGCM: gcm}, nil
 }
 
-// encrypt 确定性加密：nonce = HMAC(key, plaintext)[:12]，同一明文密文稳定可查。
-func (s *Service) encrypt(plaintext string) string {
-	mac := hmac.New(sha256.New, s.hmacKey)
+// hashKey API Key 单向哈希：HMAC-SHA256(主密钥, 明文)。
+// 主密钥作为 pepper：即使 key_hash 全库泄漏，离线穷举也需同时持有主密钥；
+// 而持有主密钥也无法从哈希反推明文（对比 v1 确定性加密：主密钥+密文=明文）。
+func hashKey(hmacKey []byte, plaintext string) string {
+	mac := hmac.New(sha256.New, hmacKey)
 	mac.Write([]byte(plaintext))
-	nonce := mac.Sum(nil)[:s.aesGCM.NonceSize()]
-	sealed := s.aesGCM.Seal(nil, nonce, []byte(plaintext), nil)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// legacyKeyHash v1 确定性 AES-GCM 加密（nonce = HMAC(明文)），可逆：
+// 持有主密钥即可解密还原明文，存在"密钥库泄漏=全部 API Key 泄漏"的风险。
+// 仅保留用于 Bootstrap 一次性升级存量记录，鉴权与新建密钥一律使用 hashKey。
+func legacyKeyHash(gcm cipher.AEAD, hmacKey []byte, plaintext string) string {
+	mac := hmac.New(sha256.New, hmacKey)
+	mac.Write([]byte(plaintext))
+	nonce := mac.Sum(nil)[:gcm.NonceSize()]
+	sealed := gcm.Seal(nil, nonce, []byte(plaintext), nil)
 	return hex.EncodeToString(append(nonce, sealed...))
 }
 
@@ -92,18 +104,27 @@ func (s *Service) CreateKey(ctx context.Context, tenantID uuid.UUID, customerID 
 	_, err = s.db.Exec(ctx, `
 INSERT INTO api_keys (id, tenant_id, customer_id, key_hash, scope, expire_at)
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6)`,
-		id.String(), tenantID.String(), customerArg, s.encrypt(plaintext), string(scopesJSON), expireArg)
+		id.String(), tenantID.String(), customerArg, hashKey(s.hmacKey, plaintext), string(scopesJSON), expireArg)
 	return id, plaintext, err
 }
 
 // Bootstrap 首次启动：确保默认租户与引导密钥存在。
+// 兼容迁移：v1 的 key_hash 为确定性 AES 加密，此处用配置中的引导密钥明文
+// 一次性升级为单向哈希（鉴权路径不再接受旧格式）。
 func (s *Service) Bootstrap(ctx context.Context, bootstrapKey string) (tenantID uuid.UUID, created bool, err error) {
+	hash := hashKey(s.hmacKey, bootstrapKey)
+	legacy := legacyKeyHash(s.legacyGCM, s.hmacKey, bootstrapKey)
+
 	var tid string
 	err = s.db.QueryRow(ctx, `SELECT id::text FROM tenants ORDER BY created_at LIMIT 1`).Scan(&tid)
 	if err == nil {
 		tenantID, _ = uuid.Parse(tid)
+		// 存量升级：旧格式引导密钥 → 新单向哈希（无匹配行则为 no-op）
+		if _, err := s.db.Exec(ctx,
+			`UPDATE api_keys SET key_hash=$1, updated_at=NOW() WHERE key_hash=$2`, hash, legacy); err != nil {
+			return tenantID, false, err
+		}
 		// 确保引导密钥可用（幂等）
-		hash := s.encrypt(bootstrapKey)
 		var cnt int
 		if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM api_keys WHERE key_hash=$1`, hash).Scan(&cnt); err != nil {
 			return tenantID, false, err
@@ -137,7 +158,7 @@ VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)`,
 	if _, err := tx.Exec(ctx, `
 INSERT INTO api_keys (id, tenant_id, key_hash, scope)
 VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)`,
-		uuid.NewString(), tenantID.String(), s.encrypt(bootstrapKey), string(scopes)); err != nil {
+		uuid.NewString(), tenantID.String(), hash, string(scopes)); err != nil {
 		return uuid.Nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -146,13 +167,13 @@ VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)`,
 	return tenantID, true, nil
 }
 
-// Authenticate 校验 Bearer 明文密钥并返回身份。
+// Authenticate 校验 Bearer 明文密钥并返回身份（仅接受单向哈希格式）。
 func (s *Service) Authenticate(ctx context.Context, plaintext string) (*Identity, error) {
-	hash := s.encrypt(plaintext)
+	hash := hashKey(s.hmacKey, plaintext)
 	var (
-		idStr, tenantStr     string
-		customerStr          *string
-		scopeJSON            []byte
+		idStr, tenantStr string
+		customerStr      *string
+		scopeJSON        []byte
 	)
 	err := s.db.QueryRow(ctx, `
 SELECT id::text, tenant_id::text, customer_id::text, scope
