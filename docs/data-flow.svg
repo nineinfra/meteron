@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="640" viewBox="0 0 980 640" font-family="-apple-system,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
-  <title>Meteron 内部数据流</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620" font-family="-apple-system,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <title>Meteron 内部数据流（实体与步骤）</title>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 Z" fill="#6B7280"/>
@@ -9,80 +9,71 @@
     </marker>
   </defs>
 
-  <rect width="980" height="640" fill="#FFFFFF"/>
+  <rect width="980" height="620" fill="#FFFFFF"/>
 
-  <!-- ===== 第 1 行：在线链路（①-④） ===== -->
-  <rect x="24" y="40" width="112" height="56" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
-  <text x="80" y="73" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">应用</text>
+  <!-- ===== 实体：第 1 行（在线链路） ===== -->
+  <rect x="24" y="40" width="110" height="60" rx="8" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="79" y="75" text-anchor="middle" font-size="15" font-weight="600" fill="#1F2937">应用</text>
 
-  <line x1="136" y1="68" x2="232" y2="68" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="184" y="57" text-anchor="middle" font-size="12" fill="#6B7280">① OpenAI 兼容</text>
+  <!-- Meteron：三框错位叠加表示多副本水平扩容 -->
+  <rect x="282" y="52" width="200" height="60" rx="8" fill="#C7D2FE" stroke="#818CF8" stroke-width="1"/>
+  <rect x="276" y="46" width="200" height="60" rx="8" fill="#E0E7FF" stroke="#818CF8" stroke-width="1"/>
+  <rect x="270" y="40" width="200" height="60" rx="8" fill="#EEF2FF" stroke="#818CF8" stroke-width="1.5"/>
+  <text x="370" y="64" text-anchor="middle" font-size="14" font-weight="600" fill="#3730A3">Meteron</text>
+  <text x="370" y="86" text-anchor="middle" font-size="11" fill="#6B7280">网关 + 后台 Worker</text>
+  <text x="370" y="30" text-anchor="middle" font-size="12" fill="#6B7280">×N 副本 · 无状态水平扩容</text>
 
-  <rect x="232" y="40" width="130" height="56" rx="8" fill="#EEF2FF" stroke="#818CF8" stroke-width="1.5"/>
-  <text x="297" y="73" text-anchor="middle" font-size="15" font-weight="600" fill="#3730A3">Gateway</text>
+  <rect x="610" y="40" width="346" height="60" rx="8" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="783" y="66" text-anchor="middle" font-size="14" font-weight="600" fill="#166534">LLM Provider</text>
+  <text x="783" y="88" text-anchor="middle" font-size="11" fill="#6B7280">（OpenAI / Anthropic / GLM / 本地 / mock）</text>
 
-  <line x1="362" y1="68" x2="460" y2="68" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="411" y="57" text-anchor="middle" font-size="12" fill="#6B7280">③ 转发上游</text>
+  <!-- ===== 实体：第 2 行（存储） ===== -->
+  <rect x="24" y="300" width="140" height="60" rx="8" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.5"/>
+  <text x="94" y="325" text-anchor="middle" font-size="14" font-weight="600" fill="#991B1B">Redis</text>
+  <text x="94" y="347" text-anchor="middle" font-size="11" fill="#6B7280">预算缓存 / 分布式锁</text>
 
-  <rect x="460" y="40" width="496" height="56" rx="8" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.5"/>
-  <text x="708" y="73" text-anchor="middle" font-size="13" font-weight="600" fill="#166534">LLM Provider（OpenAI / Anthropic / GLM / 本地模型 / mock）</text>
+  <rect x="214" y="300" width="140" height="60" rx="8" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.5"/>
+  <text x="284" y="325" text-anchor="middle" font-size="14" font-weight="600" fill="#991B1B">PostgreSQL</text>
+  <text x="284" y="347" text-anchor="middle" font-size="11" fill="#6B7280">Outbox·账本·账单</text>
 
-  <!-- ② 预算预留：Gateway 下行直落 MeterEvent 顶部 -->
-  <path d="M 297 96 V 150" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
-  <text x="287" y="124" text-anchor="end" font-size="12" fill="#2563EB">② 预算预留（Redis+PG）</text>
+  <rect x="424" y="300" width="110" height="60" rx="8" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.5"/>
+  <text x="479" y="325" text-anchor="middle" font-size="14" font-weight="600" fill="#991B1B">Kafka</text>
+  <text x="479" y="347" text-anchor="middle" font-size="11" fill="#6B7280">meter-events</text>
 
-  <!-- ④ usage 嗅探：Provider 下行，肘形路由左折落 MeterEvent 顶部 -->
-  <path d="M 708 96 V 116 H 420 V 150" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
-  <text x="564" y="110" text-anchor="middle" font-size="12" fill="#2563EB">④ usage 嗅探（含 SSE 流式）</text>
+  <rect x="604" y="300" width="352" height="60" rx="8" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.5"/>
+  <text x="780" y="325" text-anchor="middle" font-size="14" font-weight="600" fill="#991B1B">ClickHouse</text>
+  <text x="780" y="347" text-anchor="middle" font-size="11" fill="#6B7280">计量明细 + 小时预聚合</text>
 
-  <!-- ===== 第 2 行：计量事件管道（⑤） ===== -->
-  <rect x="210" y="150" width="260" height="48" rx="8" fill="#FFF7ED" stroke="#FDBA74" stroke-width="1.5"/>
-  <text x="340" y="179" text-anchor="middle" font-size="14" font-weight="600" fill="#9A3412">⑤ MeterEvent<tspan font-weight="400" fill="#7C2D12">（含费率快照）</tspan></text>
+  <!-- ===== 步骤箭头：在线链路（①③④ 同步） ===== -->
+  <line x1="134" y1="66" x2="270" y2="66" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="200" y="56" text-anchor="middle" font-size="12" fill="#6B7280">① OpenAI 兼容请求</text>
 
-  <line x1="470" y1="174" x2="560" y2="174" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="482" y1="66" x2="610" y2="66" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="540" y="56" text-anchor="middle" font-size="12" fill="#6B7280">③ 转发请求</text>
 
-  <rect x="560" y="150" width="130" height="48" rx="8" fill="#FFF7ED" stroke="#FDBA74" stroke-width="1.5"/>
-  <text x="625" y="179" text-anchor="middle" font-size="14" font-weight="600" fill="#9A3412">PG Outbox</text>
+  <line x1="610" y1="88" x2="482" y2="88" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="578" y="112" text-anchor="middle" font-size="12" fill="#6B7280">④ 响应 + usage 嗅探（SSE）</text>
 
-  <line x1="690" y1="174" x2="780" y2="174" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <!-- ===== 步骤箭头：网关 → 存储（②⑤ 异步） ===== -->
+  <path d="M 310 112 V 200 H 94 V 300" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
+  <text x="202" y="190" text-anchor="middle" font-size="12" fill="#2563EB">② 预算预留（原子扣减）</text>
 
-  <rect x="780" y="150" width="176" height="48" rx="8" fill="#FFF7ED" stroke="#FDBA74" stroke-width="1.5"/>
-  <text x="868" y="179" text-anchor="middle" font-size="14" font-weight="600" fill="#9A3412">Kafka meter-events</text>
+  <line x1="330" y1="112" x2="330" y2="300" stroke="#2563EB" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+  <text x="342" y="190" font-size="12" fill="#2563EB">⑤ MeterEvent 落 Outbox</text>
 
-  <!-- Kafka 下行 → ClickHouse -->
-  <path d="M 868 198 V 250" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
-  <text x="858" y="222" text-anchor="end" font-size="12" fill="#2563EB">先落盘再投递，崩溃不丢事件</text>
+  <!-- ===== 步骤箭头：存储间（⑥⑦） ===== -->
+  <line x1="354" y1="330" x2="424" y2="330" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="389" y="290" text-anchor="middle" font-size="12" fill="#6B7280">⑥ relay 投递</text>
 
-  <!-- ===== 第 3 行：计量聚合（⑥） ===== -->
-  <rect x="640" y="250" width="316" height="48" rx="8" fill="#ECFEFF" stroke="#67E8F9" stroke-width="1.5"/>
-  <text x="798" y="279" text-anchor="middle" font-size="14" font-weight="600" fill="#155E75">⑥ ClickHouse 明细 + 小时预聚合</text>
+  <line x1="534" y1="330" x2="604" y2="330" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="569" y="290" text-anchor="middle" font-size="12" fill="#6B7280">⑦ Sink 落库</text>
 
-  <!-- ===== 第 4 行：出账（⑦） ===== -->
-  <rect x="24" y="345" width="230" height="48" rx="8" fill="#FDF2F8" stroke="#F9A8D4" stroke-width="1.5"/>
-  <text x="139" y="374" text-anchor="middle" font-size="14" font-weight="600" fill="#9D174D">⑦ BillingRun<tspan font-weight="400" fill="#831843">（按快照计价）</tspan></text>
+  <!-- ===== 步骤箭头：出账与对账（⑧⑨ 异步，ClickHouse → PostgreSQL） ===== -->
+  <path d="M 700 360 V 420 H 300 V 360" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
+  <text x="500" y="442" text-anchor="middle" font-size="12" fill="#2563EB">⑧ BillingRun 出账</text>
 
-  <line x1="254" y1="369" x2="340" y2="369" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
-
-  <rect x="340" y="345" width="250" height="48" rx="8" fill="#FDF2F8" stroke="#F9A8D4" stroke-width="1.5"/>
-  <text x="465" y="374" text-anchor="middle" font-size="14" font-weight="600" fill="#9D174D">PG 账单 + 不可变账本流水</text>
-
-  <!-- ClickHouse → 对账 Worker（计量侧输入） -->
-  <path d="M 798 298 V 418 H 490 V 445" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
-  <text x="808" y="355" font-size="12" fill="#2563EB">计量</text>
-
-  <!-- PG 账单 → 对账 Worker（账本侧输入） -->
-  <path d="M 465 393 V 445" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
-  <text x="455" y="412" text-anchor="end" font-size="12" fill="#2563EB">账本</text>
-
-  <!-- ===== 第 5 行：对账（⑧） ===== -->
-  <rect x="360" y="445" width="200" height="60" rx="8" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.5"/>
-  <text x="460" y="473" text-anchor="middle" font-size="14" font-weight="600" fill="#5B21B6">⑧ 对账 Worker</text>
-  <text x="460" y="493" text-anchor="middle" font-size="11" fill="#6B7280">计量 vs 账本自动校准</text>
-
-  <line x1="560" y1="475" x2="680" y2="475" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
-
-  <rect x="680" y="445" width="226" height="60" rx="8" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.5"/>
-  <text x="793" y="480" text-anchor="middle" font-size="14" font-weight="600" fill="#5B21B6">差异自动红冲/补差流水</text>
+  <path d="M 860 360 V 480 H 250 V 360" stroke="#2563EB" stroke-width="1.5" fill="none" marker-end="url(#arrowBlue)"/>
+  <text x="555" y="502" text-anchor="middle" font-size="12" fill="#2563EB">⑨ 对账（差异→correction）</text>
 
   <!-- 图例 -->
   <g font-size="12" fill="#6B7280">
@@ -92,6 +83,6 @@
     <text x="150" y="583">同步调用/转发</text>
     <line x1="260" y1="579" x2="304" y2="579" stroke="#2563EB" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
     <text x="314" y="583">异步事件/数据流</text>
-    <text x="44" y="604">①–④ 在线链路（毫秒级）｜⑤–⑥ 计量管道（异步）｜⑦–⑧ 出账与对账</text>
+    <text x="44" y="604">①–④ 在线链路（毫秒级）｜⑤–⑨ 由 Meteron 后台 Worker 执行，箭头为数据流向｜Meteron 三框叠加 = 多副本水平扩容</text>
   </g>
 </svg>
