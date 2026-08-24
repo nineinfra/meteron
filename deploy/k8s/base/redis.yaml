@@ -1,0 +1,262 @@
+# Redis HA: 1 master + 2 replica（流式复制）
+# 内存策略与持久化参数全部通过 ConfigMap 注入，overlay 可覆盖
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: meteron
+  labels:
+    app: redis
+data:
+  # ---- 内存 / 淘汰策略 / 持久化 / 连接参数 ----
+  REDIS_MAXMEMORY: "1gb"
+  REDIS_MAXMEMORY_POLICY: "allkeys-lru"
+  REDIS_MAXMEMORY_SAMPLES: "5"
+  REDIS_TIMEOUT: "300"
+  REDIS_TCP_KEEPALIVE: "60"
+  REDIS_TCP_BACKLOG: "511"
+  REDIS_DATABASES: "16"
+  REDIS_APPENDONLY: "yes"
+  REDIS_APPENDFSYNC: "everysec"
+  REDIS_SAVE: "60 1000"
+  REDIS_REPL_BACKLOG_SIZE: "64mb"
+  REDIS_REPL_TIMEOUT: "300"
+  REDIS_REPL_DISKLESS_SYNC: "yes"
+  REDIS_CLIENT_OUTPUT_BUFFER_LIMIT: "replica 256mb 64mb 60"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-init
+  namespace: meteron
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    set -e
+    ORDINAL=$(hostname | awk -F'-' '{print $NF}')
+    if [ "$ORDINAL" = "0" ]; then
+      echo "Starting as Redis master..."
+      exec redis-server \
+        --appendonly ${REDIS_APPENDONLY} \
+        --appendfsync ${REDIS_APPENDFSYNC} \
+        --save "${REDIS_SAVE}" \
+        --maxmemory ${REDIS_MAXMEMORY} \
+        --maxmemory-policy ${REDIS_MAXMEMORY_POLICY} \
+        --maxmemory-samples ${REDIS_MAXMEMORY_SAMPLES} \
+        --timeout ${REDIS_TIMEOUT} \
+        --tcp-keepalive ${REDIS_TCP_KEEPALIVE} \
+        --tcp-backlog ${REDIS_TCP_BACKLOG} \
+        --databases ${REDIS_DATABASES} \
+        --repl-backlog-size ${REDIS_REPL_BACKLOG_SIZE} \
+        --repl-timeout ${REDIS_REPL_TIMEOUT} \
+        --repl-diskless-sync ${REDIS_REPL_DISKLESS_SYNC} \
+        --client-output-buffer-limit "${REDIS_CLIENT_OUTPUT_BUFFER_LIMIT}"
+    else
+      MASTER="redis-0.redis-headless.meteron.svc.cluster.local"
+      echo "Waiting for master $MASTER to be ready..."
+      until redis-cli -h "$MASTER" ping 2>/dev/null | grep -q PONG; do
+        sleep 2
+      done
+      echo "Master is ready, starting as replica..."
+      exec redis-server \
+        --appendonly ${REDIS_APPENDONLY} \
+        --appendfsync ${REDIS_APPENDFSYNC} \
+        --maxmemory ${REDIS_MAXMEMORY} \
+        --maxmemory-policy ${REDIS_MAXMEMORY_POLICY} \
+        --replicaof "$MASTER" 6379 \
+        --replica-read-only yes \
+        --repl-backlog-size ${REDIS_REPL_BACKLOG_SIZE} \
+        --repl-timeout ${REDIS_REPL_TIMEOUT} \
+        --repl-diskless-sync ${REDIS_REPL_DISKLESS_SYNC}
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: meteron
+  labels:
+    app: redis
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      name: tcp-redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-write
+  namespace: meteron
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+    role: master
+  ports:
+    - port: 6379
+      name: tcp-redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: meteron
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      name: tcp-redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: meteron
+  labels:
+    app: redis
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: replica
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ['/bin/sh', '/entrypoint/entrypoint.sh']
+          env:
+            - name: REDIS_MAXMEMORY
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_MAXMEMORY
+            - name: REDIS_MAXMEMORY_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_MAXMEMORY_POLICY
+            - name: REDIS_MAXMEMORY_SAMPLES
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_MAXMEMORY_SAMPLES
+            - name: REDIS_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_TIMEOUT
+            - name: REDIS_TCP_KEEPALIVE
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_TCP_KEEPALIVE
+            - name: REDIS_TCP_BACKLOG
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_TCP_BACKLOG
+            - name: REDIS_DATABASES
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_DATABASES
+            - name: REDIS_APPENDONLY
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_APPENDONLY
+            - name: REDIS_APPENDFSYNC
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_APPENDFSYNC
+            - name: REDIS_SAVE
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_SAVE
+            - name: REDIS_REPL_BACKLOG_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_REPL_BACKLOG_SIZE
+            - name: REDIS_REPL_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_REPL_TIMEOUT
+            - name: REDIS_REPL_DISKLESS_SYNC
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_REPL_DISKLESS_SYNC
+            - name: REDIS_CLIENT_OUTPUT_BUFFER_LIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: REDIS_CLIENT_OUTPUT_BUFFER_LIMIT
+          ports:
+            - containerPort: 6379
+              name: tcp-redis
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: redisdata
+              mountPath: /data
+            - name: entrypoint
+              mountPath: /entrypoint
+          readinessProbe:
+            exec:
+              command: ['redis-cli', 'ping']
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ['redis-cli', 'ping']
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: redis-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: redisdata
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: meteron
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: redis

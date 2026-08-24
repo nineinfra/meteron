@@ -42,7 +42,7 @@ API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对�
   按模型聚合的用量明细、预算池实时余额与进度条、账单管理（draft 一键定稿）
 - **模型对话**：与模型流式聊天（支持思考模型 reasoning 展示），每轮显示 token 用量，
   对话产生的用量实时进入监控看板
-- **管理**：API Key 管理（创建即见明文、IP/模型白名单、过期、启停）、渠道健康
+- **平台管理**：API Key 管理（创建即见明文、IP/模型白名单、过期、启停）、渠道健康
   （错误率/延迟/降级状态、人工恢复）、审计日志多维查询、在线调试沙盒
 
 控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），监控数据每 60 秒自动刷新。
@@ -294,6 +294,34 @@ METERON_HEALTH_MIN_SAMPLES=10         # 触发降级最小样本数（防小样�
 - **备份**：PostgreSQL（账本/账单，金融数据，建议每日全量+WAL 归档）；ClickHouse（计量明细，按需）；Redis 数据可重建（PG 为可信源），无需备份
 - **Kafka**：分区数即 Sink 聚合并行度，事件按 `transaction_id` 分区保证同事务顺序
 
+## Kubernetes 部署
+
+采用 **Kustomize base + overlay** 架构，全组件 CPU/内存/磁盘/连接数可配置，内置 dev（小规格）和 prod（高配）两套 profile：
+
+```bash
+./deploy/k8s/apply.sh dev      # 部署 dev 配置（小规格）
+./deploy/k8s/apply.sh prod     # 部署 prod 配置（生产高配）
+./deploy/k8s/apply.sh dry prod # 预览 prod 渲染结果（不实际部署）
+```
+
+| 组件 | 副本 | HA 方式 | 可配参数 |
+|------|------|---------|---------|
+| PostgreSQL | 3 | 流式复制 | max_connections / shared_buffers / work_mem / WAL |
+| Redis | 3 | 主从复制 | maxmemory / 淘汰策略 / 持久化 / 复制 |
+| ClickHouse | 3 | ReplicatedMergeTree + Keeper | 并发查询 / 内存 / 线程 / 缓存 |
+| Kafka | 3 | KRaft quorum | IO 线程 / 网络 / 日志保留 / 消息大小 |
+| Meteron | 2~20 | 无状态 + HPA | GOMEMLIMIT / GOMAXPROCS / 限流 / 调度 |
+
+运行时修改参数无需重建镜像：
+
+```bash
+kubectl -n meteron patch configmap postgres-config \
+  -p '{"data":{"PG_MAX_CONNECTIONS":"500"}}'
+kubectl -n meteron rollout restart statefulset postgres
+```
+
+详见 [deploy/k8s/README.md](deploy/k8s/README.md)。
+
 ## 开发
 
 ```bash
@@ -302,4 +330,28 @@ go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / 
                  #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
 ```
 
-模块结构：`internal/gateway`（在线代理）、`internal/router`（路由策略）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ingest`（事件与 outbox 投递）、`internal/health`（渠道健康）、`internal/ratelimit`（双重限流）、`internal/ui`（Web 控制台）。
+模块结构：
+
+```
+meteron/
+├── cmd/meteron/          # 程序入口
+├── internal/
+│   ├── gateway/          # 在线代理（OpenAI 兼容转发、SSE 流式、usage 嗅探）
+│   ├── router/           # 路由策略（显式指定 / auto 自动 / 成本分级）
+│   ├── ledger/           # 预算与账本（两阶段预留、confirm/release、账本流水）
+│   ├── pricing/          # 计价引擎（flat / tiered 阶梯，费率快照）
+│   ├── meter/            # 计量聚合（小时桶预聚合、Kafka 消费落 ClickHouse）
+│   ├── billing/          # 出账（BillingRun → draft 账单 → finalize 不可变）
+│   ├── recon/            # 对账（轻量小时级 / 深度每日，差异自动红冲补差）
+│   ├── ingest/           # 事件与 outbox 投递（PG Outbox → Kafka，至少一次）
+│   ├── health/           # 渠道健康（错误率/延迟统计、自动降级/恢复）
+│   ├── ratelimit/        # 双重限流（客户 RPM/TPM/并发 + Provider 并发保护）
+│   ├── rbac/             # 权限控制（scope 授权、API Key 哈希校验）
+│   ├── api/              # Management API（RESTful 管理接口）
+│   ├── config/           # 配置加载（YAML + 环境变量覆盖）
+│   └── ui/               # Web 控制台（内嵌静态资源，Vue 构建产物）
+├── web/                  # 前端源码（Vue 3 + Vite）
+├── deploy/               # 部署文件（Dockerfile、docker-compose.yml、k8s/）
+├── scripts/              # 运维脚本（verify.sh 端到端验证）
+└── docs/                 # 架构图（SVG）
+```

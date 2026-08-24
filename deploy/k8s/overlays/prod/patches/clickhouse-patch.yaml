@@ -1,0 +1,40 @@
+# prod overlay: ClickHouse 生产高配
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: meteron
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init-keeper-id
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        - name: clickhouse
+          resources:
+            requests:
+              cpu: 2000m
+              memory: 8Gi
+            limits:
+              cpu: 8000m
+              memory: 32Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: chdata
+      spec:
+        resources:
+          requests:
+            storage: 500Gi
+    - metadata:
+        name: keeperdata
+      spec:
+        resources:
+          requests:
+            storage: 10Gi

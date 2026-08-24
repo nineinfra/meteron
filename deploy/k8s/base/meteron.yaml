@@ -1,0 +1,277 @@
+# Meteron 多副本部署 + HPA + PDB + 三种 Service
+# CPU/内存/Go runtime 参数全部可配，overlay 可覆盖
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meteron-config
+  namespace: meteron
+  labels:
+    app: meteron
+data:
+  # ---- Go runtime ----
+  GOMEMLIMIT: "4GiB"
+  GOMAXPROCS: "4"
+  GOGC: "100"
+  # ---- 调度自动化 ----
+  METERON_BILLING_INTERVAL: "24h"
+  METERON_RECON_LIGHT_INTERVAL: "1h"
+  METERON_RECON_DEEP_INTERVAL: "24h"
+  # ---- 双重限流 ----
+  METERON_RATE_LIMIT_CUSTOMER_RPM: "60"
+  METERON_RATE_LIMIT_CUSTOMER_TPM: "100000"
+  METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT: "10"
+  METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT: "20"
+  # ---- 渠道健康探测 ----
+  METERON_HEALTH_PROBE_INTERVAL: "60s"
+  METERON_HEALTH_WINDOW: "5m"
+  METERON_HEALTH_ERROR_RATE_THRESHOLD: "0.5"
+  METERON_HEALTH_MIN_SAMPLES: "10"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meteron
+  namespace: meteron
+  labels:
+    app: meteron
+spec:
+  type: ClusterIP
+  selector:
+    app: meteron
+  ports:
+    - name: web
+      port: 8080
+      targetPort: 8080
+    - name: api
+      port: 9080
+      targetPort: 9080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meteron-nodeport
+  namespace: meteron
+  labels:
+    app: meteron
+spec:
+  type: NodePort
+  selector:
+    app: meteron
+  ports:
+    - name: web
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+    - name: api
+      port: 9080
+      targetPort: 9080
+      nodePort: 30090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meteron-loadbalancer
+  namespace: meteron
+  labels:
+    app: meteron
+spec:
+  type: LoadBalancer
+  selector:
+    app: meteron
+  ports:
+    - name: web
+      port: 80
+      targetPort: 8080
+    - name: api
+      port: 9080
+      targetPort: 9080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meteron
+  namespace: meteron
+  labels:
+    app: meteron
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: meteron
+  template:
+    metadata:
+      labels:
+        app: meteron
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: meteron
+          image: meteron-meteron:latest
+          imagePullPolicy: Always
+          env:
+            - name: METERON_SERVER_ADDR
+              value: ":9080"
+            - name: METERON_CONSOLE_ADDR
+              value: ":8080"
+            - name: METERON_PG_DSN
+              value: "host=postgres-write port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable"
+            - name: METERON_CLICKHOUSE_DSN
+              value: "clickhouse://meteron:meteron123@clickhouse:9000/meteron"
+            - name: METERON_KAFKA_BROKERS
+              value: "kafka-0.kafka-headless.meteron.svc.cluster.local:9092,kafka-1.kafka-headless.meteron.svc.cluster.local:9092,kafka-2.kafka-headless.meteron.svc.cluster.local:9092"
+            - name: METERON_KAFKA_TOPIC
+              value: "meteron.meter-events"
+            - name: METERON_REDIS_ADDR
+              value: "redis:6379"
+            - name: METERON_AES_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meteron-secret
+                  key: METERON_AES_KEY
+            - name: METERON_BOOTSTRAP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: meteron-secret
+                  key: METERON_BOOTSTRAP_API_KEY
+            # Go runtime 从 ConfigMap 注入
+            - name: GOMEMLIMIT
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: GOMEMLIMIT
+            - name: GOMAXPROCS
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: GOMAXPROCS
+            - name: GOGC
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: GOGC
+            # 调度自动化
+            - name: METERON_BILLING_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_BILLING_INTERVAL
+            - name: METERON_RECON_LIGHT_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RECON_LIGHT_INTERVAL
+            - name: METERON_RECON_DEEP_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RECON_DEEP_INTERVAL
+            # 双重限流
+            - name: METERON_RATE_LIMIT_CUSTOMER_RPM
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RATE_LIMIT_CUSTOMER_RPM
+            - name: METERON_RATE_LIMIT_CUSTOMER_TPM
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RATE_LIMIT_CUSTOMER_TPM
+            - name: METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT
+            - name: METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT
+            # 渠道健康探测
+            - name: METERON_HEALTH_PROBE_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_HEALTH_PROBE_INTERVAL
+            - name: METERON_HEALTH_WINDOW
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_HEALTH_WINDOW
+            - name: METERON_HEALTH_ERROR_RATE_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_HEALTH_ERROR_RATE_THRESHOLD
+            - name: METERON_HEALTH_MIN_SAMPLES
+              valueFrom:
+                configMapKeyRef:
+                  name: meteron-config
+                  key: METERON_HEALTH_MIN_SAMPLES
+          ports:
+            - containerPort: 8080
+              name: web
+            - containerPort: 9080
+              name: api
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: meteron-hpa
+  namespace: meteron
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: meteron
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: meteron-pdb
+  namespace: meteron
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: meteron

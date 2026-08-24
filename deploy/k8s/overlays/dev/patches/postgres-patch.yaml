@@ -1,0 +1,40 @@
+# dev overlay: PostgreSQL 降配
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: meteron
+spec:
+  template:
+    spec:
+      containers:
+        - name: postgres
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: meteron
+data:
+  PG_MAX_CONNECTIONS: "100"
+  PG_SHARED_BUFFERS: "128MB"
+  PG_EFFECTIVE_CACHE_SIZE: "512MB"
+  PG_WORK_MEM: "8MB"
+  PG_MAINTENANCE_WORK_MEM: "128MB"
+  PG_WAL_BUFFERS: "4MB"
+  PG_MAX_WAL_SENDERS: "5"
+  PG_MAX_REPLICATION_SLOTS: "5"

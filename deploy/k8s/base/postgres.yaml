@@ -1,0 +1,330 @@
+# PostgreSQL HA: 1 primary + 2 hot standby (streaming replication)
+# 资源与连接参数全部通过 ConfigMap 注入，overlay 可覆盖
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: meteron
+  labels:
+    app: postgres
+data:
+  # ---- 连接数 / 内存 / WAL 参数（通过 entrypoint.sh 注入 postgresql.conf）----
+  PG_MAX_CONNECTIONS: "200"
+  PG_SHARED_BUFFERS: "512MB"
+  PG_EFFECTIVE_CACHE_SIZE: "2GB"
+  PG_WORK_MEM: "16MB"
+  PG_MAINTENANCE_WORK_MEM: "256MB"
+  PG_WAL_BUFFERS: "16MB"
+  PG_CHECKPOINT_COMPLETION_TARGET: "0.9"
+  PG_RANDOM_PAGE_COST: "1.1"
+  PG_MAX_WAL_SENDERS: "10"
+  PG_MAX_REPLICATION_SLOTS: "10"
+  PG_WAL_KEEP_SIZE: "1024"
+  PG_STATEMENT_TIMEOUT: "0"
+  PG_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: "300s"
+  PG_LOG_MIN_DURATION_STATEMENT: "1000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: meteron
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -e
+    ORDINAL=$(hostname | awk -F'-' '{print $NF}')
+
+    if [ "$ORDINAL" = "0" ]; then
+      cat >> "$PGDATA/postgresql.conf" <<EOF
+    listen_addresses = '*'
+    wal_level = replica
+    max_wal_senders = ${PG_MAX_WAL_SENDERS}
+    max_replication_slots = ${PG_MAX_REPLICATION_SLOTS}
+    wal_keep_size = ${PG_WAL_KEEP_SIZE}
+    hot_standby = on
+    max_connections = ${PG_MAX_CONNECTIONS}
+    shared_buffers = ${PG_SHARED_BUFFERS}
+    effective_cache_size = ${PG_EFFECTIVE_CACHE_SIZE}
+    work_mem = ${PG_WORK_MEM}
+    maintenance_work_mem = ${PG_MAINTENANCE_WORK_MEM}
+    wal_buffers = ${PG_WAL_BUFFERS}
+    checkpoint_completion_target = ${PG_CHECKPOINT_COMPLETION_TARGET}
+    random_page_cost = ${PG_RANDOM_PAGE_COST}
+    statement_timeout = ${PG_STATEMENT_TIMEOUT}
+    idle_in_transaction_session_timeout = ${PG_IDLE_IN_TRANSACTION_SESSION_TIMEOUT}
+    log_min_duration_statement = ${PG_LOG_MIN_DURATION_STATEMENT}
+    EOF
+      echo "host replication replicator 0.0.0.0/0 md5" >> "$PGDATA/pg_hba.conf"
+      psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
+            CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+          END IF;
+        END
+        \$\$;
+    EOSQL
+      exec postgres
+    else
+      PRIMARY_HOST="${PG_PRIMARY_SERVICE}-0.${PG_HEADLESS_SERVICE}"
+      if [ ! -f "$PGDATA/PG_VERSION" ]; then
+        echo "Waiting for primary to be ready..."
+        until pg_isready -h "$PRIMARY_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do
+          sleep 3
+        done
+        echo "Primary is ready, starting pg_basebackup..."
+        PGPASSWORD="${REPLICATION_PASSWORD}" pg_basebackup \
+          -h "$PRIMARY_HOST" -U replicator -D "$PGDATA" -Fp -Xs -P -R
+      fi
+      exec postgres
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: meteron
+  labels:
+    app: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      name: tcp-pg
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-write
+  namespace: meteron
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+    role: primary
+  ports:
+    - port: 5432
+      name: tcp-pg
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-read
+  namespace: meteron
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      name: tcp-pg
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: meteron
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: standby
+    spec:
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: init-pgdata
+          image: postgres:16-alpine
+          command: ['/bin/sh', '-c']
+          args:
+            - |
+              ORDINAL=$(hostname | awk -F'-' '{print $NF}')
+              if [ "$ORDINAL" = "0" ]; then
+                echo "primary" > /pgdata/role
+              else
+                echo "standby" > /pgdata/role
+              fi
+              chmod 700 /pgdata || true
+          env:
+            - name: PGDATA
+              value: /pgdata
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: pgdata
+              mountPath: /pgdata
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          command: ['/bin/bash', '/entrypoint/entrypoint.sh']
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_DB
+            - name: REPLICATION_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: REPLICATION_USER
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: REPLICATION_PASSWORD
+            - name: PG_PRIMARY_SERVICE
+              value: postgres
+            - name: PG_HEADLESS_SERVICE
+              value: postgres-headless.meteron.svc.cluster.local
+            # 从 ConfigMap 注入所有可调参数
+            - name: PG_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_MAX_CONNECTIONS
+            - name: PG_SHARED_BUFFERS
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_SHARED_BUFFERS
+            - name: PG_EFFECTIVE_CACHE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_EFFECTIVE_CACHE_SIZE
+            - name: PG_WORK_MEM
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_WORK_MEM
+            - name: PG_MAINTENANCE_WORK_MEM
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_MAINTENANCE_WORK_MEM
+            - name: PG_WAL_BUFFERS
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_WAL_BUFFERS
+            - name: PG_CHECKPOINT_COMPLETION_TARGET
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_CHECKPOINT_COMPLETION_TARGET
+            - name: PG_RANDOM_PAGE_COST
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_RANDOM_PAGE_COST
+            - name: PG_MAX_WAL_SENDERS
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_MAX_WAL_SENDERS
+            - name: PG_MAX_REPLICATION_SLOTS
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_MAX_REPLICATION_SLOTS
+            - name: PG_WAL_KEEP_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_WAL_KEEP_SIZE
+            - name: PG_STATEMENT_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_STATEMENT_TIMEOUT
+            - name: PG_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+            - name: PG_LOG_MIN_DURATION_STATEMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: PG_LOG_MIN_DURATION_STATEMENT
+          ports:
+            - containerPort: 5432
+              name: tcp-pg
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: entrypoint
+              mountPath: /entrypoint
+          readinessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'meteron', '-d', 'meteron']
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'meteron', '-d', 'meteron']
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+  namespace: meteron
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: postgres

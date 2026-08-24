@@ -1,0 +1,35 @@
+# dev overlay: Kafka 降配
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: meteron
+spec:
+  template:
+    spec:
+      containers:
+        - name: kafka
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: kafkadata
+      spec:
+        resources:
+          requests:
+            storage: 15Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: meteron
+data:
+  KAFKA_NUM_IO_THREADS: "4"
+  KAFKA_NUM_NETWORK_THREADS: "2"
+  KAFKA_LOG_RETENTION_HOURS: "72"

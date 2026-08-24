@@ -1,0 +1,54 @@
+# prod overlay: Meteron 生产高配
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meteron
+  namespace: meteron
+spec:
+  replicas: 5
+  template:
+    spec:
+      containers:
+        - name: meteron
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 1Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meteron-config
+  namespace: meteron
+data:
+  GOMEMLIMIT: "7GiB"
+  GOMAXPROCS: "4"
+  METERON_RATE_LIMIT_CUSTOMER_RPM: "200"
+  METERON_RATE_LIMIT_CUSTOMER_TPM: "500000"
+  METERON_RATE_LIMIT_CUSTOMER_MAX_CONCURRENT: "50"
+  METERON_RATE_LIMIT_PROVIDER_MAX_CONCURRENT: "100"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: meteron-hpa
+  namespace: meteron
+spec:
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70

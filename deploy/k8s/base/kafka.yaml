@@ -1,0 +1,331 @@
+# Kafka HA: 3 KRaft broker（controller + broker 合一，无 ZooKeeper）
+# 线程/内存/日志保留参数全部通过 ConfigMap 注入，overlay 可覆盖
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: meteron
+  labels:
+    app: kafka
+data:
+  # ---- 分区 / 副本 / ISR 参数 ----
+  KAFKA_NUM_PARTITIONS: "6"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  # ---- 线程 / 网络 / 缓冲区 ----
+  KAFKA_NUM_NETWORK_THREADS: "3"
+  KAFKA_NUM_IO_THREADS: "8"
+  KAFKA_SOCKET_SEND_BUFFER_BYTES: "102400"
+  KAFKA_SOCKET_RECEIVE_BUFFER_BYTES: "102400"
+  KAFKA_SOCKET_REQUEST_MAX_BYTES: "104857600"
+  KAFKA_QUEUED_MAX_REQUESTS: "500"
+  KAFKA_QUEUED_MAX_BYTES: "104857600"
+  # ---- 日志保留 / 段大小 ----
+  KAFKA_LOG_RETENTION_HOURS: "168"
+  KAFKA_LOG_RETENTION_BYTES: "-1"
+  KAFKA_LOG_SEGMENT_BYTES: "1073741824"
+  KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"
+  # ---- 消息大小 ----
+  KAFKA_MESSAGE_MAX_BYTES: "1048588"
+  KAFKA_REPLICA_FETCH_MAX_BYTES: "1048576"
+  KAFKA_MAX_MESSAGE_BYTES: "1048588"
+  # ---- 复制 / Fetch ----
+  KAFKA_REPLICA_LAG_TIME_MAX_MS: "30000"
+  KAFKA_REPLICA_FETCH_WAIT_MAX_MS: "500"
+  KAFKA_REPLICA_FETCH_MIN_BYTES: "1"
+  KAFKA_CONTROLLER_SOCKET_TIMEOUT_MS: "30000"
+  KAFKA_REQUEST_TIMEOUT_MS: "30000"
+  # ---- GC ----
+  KAFKA_GC_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-init
+  namespace: meteron
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -e
+    ORDINAL=$(hostname | awk -F'-' '{print $NF}')
+    NODE_ID="$ORDINAL"
+    HEADLESS="kafka-headless.meteron.svc.cluster.local"
+    POD_FQDN="kafka-${ORDINAL}.${HEADLESS}"
+
+    QUORUM_VOTERS=""
+    for i in 0 1 2; do
+      if [ -n "$QUORUM_VOTERS" ]; then
+        QUORUM_VOTERS="${QUORUM_VOTERS},"
+      fi
+      QUORUM_VOTERS="${QUORUM_VOTERS}${i}@kafka-${i}.${HEADLESS}:9093"
+    done
+
+    export KAFKA_CFG_NODE_ID="$NODE_ID"
+    export KAFKA_CFG_PROCESS_ROLES="controller,broker"
+    export KAFKA_CFG_LISTENERS="PLAINTEXT://:9092,CONTROLLER://:9093"
+    export KAFKA_CFG_ADVERTISED_LISTENERS="PLAINTEXT://${POD_FQDN}:9092"
+    export KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP="CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+    export KAFKA_CFG_CONTROLLER_QUORUM_VOTERS="$QUORUM_VOTERS"
+    export KAFKA_CFG_CONTROLLER_LISTENER_NAMES="CONTROLLER"
+    export KAFKA_CFG_INTER_BROKER_LISTENER_NAME="PLAINTEXT"
+    export KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE="${KAFKA_AUTO_CREATE_TOPICS_ENABLE}"
+    export KAFKA_CFG_NUM_PARTITIONS="${KAFKA_NUM_PARTITIONS}"
+    export KAFKA_CFG_DEFAULT_REPLICATION_FACTOR="${KAFKA_DEFAULT_REPLICATION_FACTOR}"
+    export KAFKA_CFG_MIN_INSYNC_REPLICAS="${KAFKA_MIN_INSYNC_REPLICAS}"
+    export KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR="${KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR}"
+    export KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR="${KAFKA_TRANSACTION_STATE_LOG_MIN_ISR}"
+    export KAFKA_CFG_NUM_NETWORK_THREADS="${KAFKA_NUM_NETWORK_THREADS}"
+    export KAFKA_CFG_NUM_IO_THREADS="${KAFKA_NUM_IO_THREADS}"
+    export KAFKA_CFG_SOCKET_SEND_BUFFER_BYTES="${KAFKA_SOCKET_SEND_BUFFER_BYTES}"
+    export KAFKA_CFG_SOCKET_RECEIVE_BUFFER_BYTES="${KAFKA_SOCKET_RECEIVE_BUFFER_BYTES}"
+    export KAFKA_CFG_SOCKET_REQUEST_MAX_BYTES="${KAFKA_SOCKET_REQUEST_MAX_BYTES}"
+    export KAFKA_CFG_QUEUED_MAX_REQUESTS="${KAFKA_QUEUED_MAX_REQUESTS}"
+    export KAFKA_CFG_LOG_RETENTION_HOURS="${KAFKA_LOG_RETENTION_HOURS}"
+    export KAFKA_CFG_LOG_RETENTION_BYTES="${KAFKA_LOG_RETENTION_BYTES}"
+    export KAFKA_CFG_LOG_SEGMENT_BYTES="${KAFKA_LOG_SEGMENT_BYTES}"
+    export KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS="${KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS}"
+    export KAFKA_CFG_MESSAGE_MAX_BYTES="${KAFKA_MESSAGE_MAX_BYTES}"
+    export KAFKA_CFG_REPLICA_FETCH_MAX_BYTES="${KAFKA_REPLICA_FETCH_MAX_BYTES}"
+    export KAFKA_CFG_REPLICA_LAG_TIME_MAX_MS="${KAFKA_REPLICA_LAG_TIME_MAX_MS}"
+    export KAFKA_CFG_REPLICA_FETCH_WAIT_MAX_MS="${KAFKA_REPLICA_FETCH_WAIT_MAX_MS}"
+    export KAFKA_CFG_REPLICA_FETCH_MIN_BYTES="${KAFKA_REPLICA_FETCH_MIN_BYTES}"
+    export KAFKA_CFG_CONTROLLER_SOCKET_TIMEOUT_MS="${KAFKA_CONTROLLER_SOCKET_TIMEOUT_MS}"
+    export KAFKA_CFG_REQUEST_TIMEOUT_MS="${KAFKA_REQUEST_TIMEOUT_MS}"
+
+    if [ ! -f /bitnami/kafka/data/meta.properties ]; then
+      echo "Formatting KRaft storage for node $NODE_ID..."
+      KAFKA_CLUSTER_ID="$(kafka-storage random-uuid)"
+      kafka-storage format --cluster-id "$KAFKA_CLUSTER_ID" \
+        --config /opt/bitnami/kafka/config/server.properties \
+        --ignore-formatted
+    fi
+
+    echo "Starting Kafka broker $NODE_ID (advertised: ${POD_FQDN}:9092)"
+    exec kafka-server-start.sh /opt/bitnami/kafka/config/server.properties
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: meteron
+  labels:
+    app: kafka
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+    - name: tcp-client
+      port: 9092
+    - name: tcp-controller
+      port: 9093
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: meteron
+  labels:
+    app: kafka
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: tcp-client
+      port: 9092
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: meteron
+  labels:
+    app: kafka
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: kafka
+          image: bitnami/kafka:3.7
+          command: ['/bin/bash', '/entrypoint/entrypoint.sh']
+          env:
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+            - name: KAFKA_NUM_PARTITIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_NUM_PARTITIONS
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_DEFAULT_REPLICATION_FACTOR
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_MIN_INSYNC_REPLICAS
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+            - name: KAFKA_NUM_NETWORK_THREADS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_NUM_NETWORK_THREADS
+            - name: KAFKA_NUM_IO_THREADS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_NUM_IO_THREADS
+            - name: KAFKA_SOCKET_SEND_BUFFER_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_SOCKET_SEND_BUFFER_BYTES
+            - name: KAFKA_SOCKET_RECEIVE_BUFFER_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_SOCKET_RECEIVE_BUFFER_BYTES
+            - name: KAFKA_SOCKET_REQUEST_MAX_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_SOCKET_REQUEST_MAX_BYTES
+            - name: KAFKA_QUEUED_MAX_REQUESTS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_QUEUED_MAX_REQUESTS
+            - name: KAFKA_LOG_RETENTION_HOURS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_LOG_RETENTION_HOURS
+            - name: KAFKA_LOG_RETENTION_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_LOG_RETENTION_BYTES
+            - name: KAFKA_LOG_SEGMENT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_LOG_SEGMENT_BYTES
+            - name: KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS
+            - name: KAFKA_MESSAGE_MAX_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_MESSAGE_MAX_BYTES
+            - name: KAFKA_REPLICA_FETCH_MAX_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_REPLICA_FETCH_MAX_BYTES
+            - name: KAFKA_REPLICA_LAG_TIME_MAX_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_REPLICA_LAG_TIME_MAX_MS
+            - name: KAFKA_REPLICA_FETCH_WAIT_MAX_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_REPLICA_FETCH_WAIT_MAX_MS
+            - name: KAFKA_REPLICA_FETCH_MIN_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_REPLICA_FETCH_MIN_BYTES
+            - name: KAFKA_CONTROLLER_SOCKET_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_CONTROLLER_SOCKET_TIMEOUT_MS
+            - name: KAFKA_REQUEST_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-config
+                  key: KAFKA_REQUEST_TIMEOUT_MS
+          ports:
+            - containerPort: 9092
+              name: tcp-client
+            - containerPort: 9093
+              name: tcp-controller
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+          volumeMounts:
+            - name: kafkadata
+              mountPath: /bitnami/kafka
+            - name: entrypoint
+              mountPath: /entrypoint
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: kafka-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: kafkadata
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 30Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-pdb
+  namespace: meteron
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: kafka

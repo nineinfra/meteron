@@ -1,0 +1,37 @@
+# dev overlay: Meteron 降配
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meteron
+  namespace: meteron
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: meteron
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meteron-config
+  namespace: meteron
+data:
+  GOMEMLIMIT: "1GiB"
+  GOMAXPROCS: "2"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: meteron-hpa
+  namespace: meteron
+spec:
+  minReplicas: 1
+  maxReplicas: 3

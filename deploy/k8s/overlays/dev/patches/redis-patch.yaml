@@ -1,0 +1,33 @@
+# dev overlay: Redis 降配
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: meteron
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: redisdata
+      spec:
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: meteron
+data:
+  REDIS_MAXMEMORY: "256mb"

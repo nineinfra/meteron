@@ -16,7 +16,7 @@ const state = reactive({ customers: [] })
 const menus = [
   { key: 'monitor', label: '监控看板', icon: '◧' },
   { key: 'chat', label: '模型对话', icon: '✳' },
-  { key: 'admin', label: '管理', icon: '⚙' },
+  { key: 'admin', label: '平台管理', icon: '⚙' },
 ]
 const route = ref('monitor')
 
