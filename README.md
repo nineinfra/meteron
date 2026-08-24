@@ -86,19 +86,9 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 ### 内部数据流
 
-```
-应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/本地模型/mock)
-                       │ 预算预留(Redis+PG)      │ usage 嗅探(含 SSE 流式)
-                       ▼                         ▼
-                    MeterEvent(含费率快照) ──▶ PG Outbox ──▶ Kafka meter-events
-                                                     │ 先落盘再投递，崩溃不丢事件
-                                                     ▼
-                                        ClickHouse 明细 + 小时预聚合
-                                                     │
-                    BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
-                                                     │
-                    对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
-```
+![内部数据流](docs/data-flow.svg)
+
+> 图源文件为 [docs/data-flow.svg](docs/data-flow.svg)（纯文本 SVG，可直接编辑）。
 
 - **在线链路**只做轻量预算校验与转发（毫秒级）；计价、记账、出账全部异步，不阻塞请求。
 - **事件可靠性**：计量事件先落 PG Outbox 再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
