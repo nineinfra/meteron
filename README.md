@@ -1,6 +1,6 @@
 # Meteron
 
-自托管的 **LLM 计量计费网关**：应用把 LLM 请求指向 Meteron，即可获得 token 级计量、实时预算管控、精确计费与自动对账。数据 100% 自持，不经过任何第三方。
+Meteron 是开源 **AI Token 计量计费网关**。面向大模型服务场景，统一统计 LLM 请求输入/输出 Token，完成费用核算、调用限流、用量审计，支持对接多厂商大模型接口，可作为 OpenAI‑兼容网关计费层，适配私有部署、企业内部大模型平台、多租户 AI 应用。
 
 ## 核心价值
 
@@ -355,3 +355,10 @@ meteron/
 ├── scripts/              # 运维脚本（verify.sh 端到端验证）
 └── docs/                 # 架构图（SVG）
 ```
+
+## License
+
+Meteron is licensed under Apache 2.0 License.
+
+See [LICENSE](./LICENSE) for full license text.
+
