@@ -78,49 +78,29 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 应用与外部系统通过以下接口将 Meteron 集成到自己的体系中（详细参数见 `scripts/verify.sh`）：
 
-```
-┌──────────────┐ OpenAI 兼容   ┌────────────────────────────────────────────────────┐
-│   用户应用    │ ────────────▶ │ POST /v1/chat/completions          LLM 代理网关   │
-│ (只改base_url)│               ├────────────────────────────────────────────────────┤
-└──────────────┘               │ Management API（REST，前缀 /api/v1）                │
-┌──────────────┐  REST         │  供给链  customers · billable-metrics · products   │
-│   管理系统    │ ────────────▶ │          rate-cards(+/{id}/rules) · contracts     │
-│ (供给/账单)   │               │  预算    budget-pools · budget-pools/{id}/balance │
-└──────────────┘               │          budget-reservations/{id}/confirm|release │
-┌──────────────┐  事件上报      │  用量    GET /usage · GET /usage/timeseries        │
-│  计量系统     │ ────────────▶ │  事件    POST /ingest/events                       │
-└──────────────┘               │  账单    bills(+/{id}/finalize|amend) ·           │
-┌──────────────┐  Prometheus   │          billing-runs · reconciliation-runs       │
-│  监控告警     │ ◀──────────── │  模型    GET /models                              │
-└──────────────┘               │  密钥    api-keys(POST/GET/PATCH启停/DELETE)      │
-┌──────────────┐  浏览器:8080   │  渠道    providers/health · /{name}/enable|disable │
-│  Web 控制台   │ ────────────▶  审计    GET /audit/events（多维过滤）              │
-└──────────────┘               │  调试    POST /debug/chat（沙盒直发）             │
-                               │  运维    GET /metrics · GET /healthz（免鉴权）     │
-                               └────────────────────────────────────────────────────┘
-```
+![对外 API 接口（集成视图）](docs/integration-view.svg)
+
+> 图源文件为 [docs/integration-view.svg](docs/integration-view.svg)（纯文本 SVG，可直接编辑）。
 
 > 所有业务接口鉴权：`Authorization: Bearer <api-key>`；端点：API/网关 `:9080`，Web 控制台 `:8080`。
 
 ### 内部数据流
 
-```
-应用 ──OpenAI 兼容──▶ Gateway ──转发──▶ LLM Provider (OpenAI/Anthropic/GLM/本地模型/mock)
-                       │ 预算预留(Redis+PG)      │ usage 嗅探(含 SSE 流式)
-                       ▼                         ▼
-                    MeterEvent(含费率快照) ──▶ PG Outbox ──▶ Kafka meter-events
-                                                     │ 先落盘再投递，崩溃不丢事件
-                                                     ▼
-                                        ClickHouse 明细 + 小时预聚合
-                                                     │
-                    BillingRun(按快照计价) ──▶ PG 账单 + 不可变账本流水
-                                                     │
-                    对账 Worker ◀── 计量 vs 账本自动校准（差异→correction 流水）
-```
+![内部数据流](docs/data-flow.svg)
 
-- **在线链路**只做轻量预算校验与转发（毫秒级）；计价、记账、出账全部异步，不阻塞请求。
-- **事件可靠性**：计量事件先落 PG Outbox 再投递 Kafka（至少一次语义），进程崩溃不丢事件；下游按 `event_id` 幂等去重。
-- **幂等保证**：事件按 `event_id` 去重，账单跑批可安全重跑，同一 `Idempotency-Key` 不重复计费。
+> 图源文件为 [docs/data-flow.svg](docs/data-flow.svg)（纯文本 SVG，可直接编辑）。
+
+图中方框为实体（应用 / Meteron / LLM Provider / Redis / PostgreSQL / Kafka / ClickHouse），带编号箭头为步骤及流转的数据。箭头方向 = 数据流转方向（起点为读取源，终点为写入目标），步骤执行者标注在箭头标签中：①–④ 由 Meteron 网关同步执行（毫秒级）；⑤–⑨ 由 Meteron 进程内后台 Worker（relay / sink / billing / recon）异步执行，不阻塞请求。Meteron 框以三层错位叠加表示多副本部署：网关无状态、可水平扩容；后台 Worker 经 Redis 分布式锁保证多副本下仅单实例执行。
+
+- **① 请求接入**：应用以 OpenAI 兼容协议调用网关，只改 `base_url` 与鉴权头；网关完成 API-Key 鉴权（HMAC-SHA256 哈希等值查找）、IP/模型白名单与客户/渠道双重限流校验。
+- **② 预算预留**：网关按 `max_tokens` 估算金额，Redis 原子扣减预算缓存（快路径）+ PG 预留表落库复核（可信源）两阶段预留；超额按策略 block/warn/fallback，请求结束按实际用量 confirm（差额归还）或 release。
+- **③ 转发上游**：网关将请求透明转发至 LLM Provider（OpenAI / Anthropic / GLM / 本地模型 / mock）；路由或降级切换模型时同步重写请求体 `model` 字段，保证计费模型与实际执行模型一致。
+- **④ 响应与 usage 嗅探**：网关边透传响应边解析 token 用量——非流式解析 JSON，流式逐帧解析 SSE（自动注入 `stream_options.include_usage`）；计费收尾脱离请求生命周期，客户端断开也不丢账。
+- **⑤ 计量事件落 Outbox**：网关产出内嵌费率快照的 MeterEvent（改价不影响历史账单），事务写入 PG Outbox 表持久化（崩溃不丢事件），并 confirm 预算预留。
+- **⑥ 事件投递**：Meteron 进程内 relay Worker 从 PG Outbox 捞取未发布事件投递 Kafka（`meter-events` 主题，按 `transaction_id` 分区保序），成功标记 `published_at` 并定期清理；Kafka 不可用不阻塞在线链路。Outbox 仅作可靠性中转——PG 只短暂保留近期事件（已发布即清理），全量计量明细长期存 ClickHouse。
+- **⑦ 消费落库**：Meteron 进程内 sink Worker 消费 Kafka 写入 ClickHouse 计量明细（写成功才提交 offset，至少一次语义 + `event_id` 幂等去重）；聚合器按小时桶预聚合，offset 只提交已落盘小时的连续前缀。
+- **⑧ 出账**：Meteron 进程内 billing Worker 执行 BillingRun，从 ClickHouse 读取明细按费率快照计价（跨档按累计 token 切分），生成 draft 账单 + 账单项 + 不可变账本流水写入 PG；finalize 后账单不可变，跑批幂等可安全重跑。
+- **⑨ 对账**：Meteron 进程内 recon Worker 每小时轻量对账（明细 vs 预聚合）、每日深度对账（ClickHouse 重算金额 vs PG 账本流水合计），差异自动生成 correction 流水写回 PG——多记红冲、少记补差，账本只增不改。
 
 ## 生产级使用步骤
 
