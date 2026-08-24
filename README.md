@@ -79,24 +79,24 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 应用与外部系统通过以下接口将 Meteron 集成到自己的体系中（详细参数见 `scripts/verify.sh`）：
 
 ```
-┌──────────────┐ OpenAI 兼容   ┌────────────────────────────────────────────────────┐
-│   用户应用    │ ────────────▶ │ POST /v1/chat/completions          LLM 代理网关   │
-│ (只改base_url)│               ├────────────────────────────────────────────────────┤
-└──────────────┘               │ Management API（REST，前缀 /api/v1）                │
-┌──────────────┐  REST         │  供给链  customers · billable-metrics · products   │
-│   管理系统    │ ────────────▶ │          rate-cards(+/{id}/rules) · contracts     │
-│ (供给/账单)   │               │  预算    budget-pools · budget-pools/{id}/balance │
-└──────────────┘               │          budget-reservations/{id}/confirm|release │
-┌──────────────┐  事件上报      │  用量    GET /usage · GET /usage/timeseries        │
-│  计量系统     │ ────────────▶ │  事件    POST /ingest/events                       │
-└──────────────┘               │  账单    bills(+/{id}/finalize|amend) ·           │
-┌──────────────┐  Prometheus   │          billing-runs · reconciliation-runs       │
-│  监控告警     │ ◀──────────── │  模型    GET /models                              │
-└──────────────┘               │  密钥    api-keys(POST/GET/PATCH启停/DELETE)      │
-┌──────────────┐  浏览器:8080   │  渠道    providers/health · /{name}/enable|disable │
-│  Web 控制台   │ ────────────▶  审计    GET /audit/events（多维过滤）              │
-└──────────────┘               │  调试    POST /debug/chat（沙盒直发）             │
-                               │  运维    GET /metrics · GET /healthz（免鉴权）     │
+┌───────────────┐ OpenAI 兼容  ┌────────────────────────────────────────────────────┐
+│   用户应用    │ ───────────▶ │ POST /v1/chat/completions              LLM 代理网关│
+│ (只改base_url)│              ├────────────────────────────────────────────────────┤
+└───────────────┘              │ Management API（REST，前缀 /api/v1）               │
+┌───────────────┐ REST         │ 供给链 customers · billable-metrics · products     │
+│   管理系统    │ ───────────▶ │        rate-cards(+/{id}/rules) · contracts        │
+│ (供给/账单)   │              │ 预算   budget-pools · budget-pools/{id}/balance    │
+└───────────────┘              │        budget-reservations/{id}/confirm|release    │
+┌───────────────┐ 事件上报     │ 用量   GET /usage · GET /usage/timeseries          │
+│  计量系统     │ ───────────▶ │ 事件   POST /ingest/events                         │
+└───────────────┘              │ 账单   bills(+/{id}/finalize|amend) ·              │
+┌───────────────┐ Prometheus   │        billing-runs · reconciliation-runs          │
+│  监控告警     │ ◀─────────── │ 模型   GET /models                                 │
+└───────────────┘              │ 密钥   api-keys(POST/GET/PATCH启停/DELETE)         │
+┌───────────────┐ 浏览器:8080  │ 渠道   providers/health · /{name}/enable|disable   │
+│ Web 控制台    │ ───────────▶ │ 审计   GET /audit/events（多维过滤）               │
+└───────────────┘              │ 调试   POST /debug/chat（沙盒直发）                │
+                               │ 运维   GET /metrics · GET /healthz（免鉴权）       │
                                └────────────────────────────────────────────────────┘
 ```
 
