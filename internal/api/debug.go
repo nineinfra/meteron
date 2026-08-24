@@ -46,6 +46,12 @@ func (s *Server) debugChat(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set(h, v)
 		}
 	}
+	// 透传来源地址与 XFF 链：网关 IP 白名单按真实来源判定。
+	// 内部构造的请求 RemoteAddr 为空串，带 IP 白名单的密钥会被 fail-closed 拒绝（必现 403）。
+	req.RemoteAddr = r.RemoteAddr
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		req.Header.Set("X-Forwarded-For", v)
+	}
 
 	rec := newCaptureWriter()
 	s.gateway.ServeHTTP(rec, req)

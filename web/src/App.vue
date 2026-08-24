@@ -78,8 +78,7 @@ onUnmounted(() => window.removeEventListener('hashchange', applyHash))
     <div class="gate-box">
       <div class="logo big">M</div>
       <h1>Meteron 控制台</h1>
-      <p class="gate-tip">输入 API Key 连接本实例（开发环境默认
-        <code>mk_meteron_bootstrap_dev_key</code>）</p>
+      <p class="gate-tip">输入 API Key 连接本实例</p>
       <input v-model="gateKey" type="password" placeholder="API Key（Bearer Token）"
         autocomplete="off" @keydown.enter="connect(gateKey.trim())">
       <button class="btn primary wide" @click="connect(gateKey.trim())">连接</button>

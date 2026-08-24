@@ -14,21 +14,38 @@ import (
 	"github.com/meteron/meteron/internal/ratelimit"
 )
 
-// ---- clientIP ----
+// ---- clientIP（可信代理语义：对端命中 trustedProxies 才解析 XFF，右起第一个非可信 IP）----
+
+var testTrusted = []string{"127.0.0.1", "::1", "10.0.0.0/8"}
 
 func TestClientIP(t *testing.T) {
 	cases := []struct {
 		name       string
 		remoteAddr string
 		xff        string
+		trusted    []string
 		want       string
 	}{
-		{"RemoteAddr 提取 host", "192.0.2.10:52341", "", "192.0.2.10"},
-		{"无端口 RemoteAddr 原样", "unix", "", "unix"},
-		{"XFF 优先", "10.0.0.1:1000", "203.0.113.5", "203.0.113.5"},
-		{"XFF 多段取首段", "10.0.0.1:1000", "203.0.113.5, 70.41.3.18, 150.172.238.178", "203.0.113.5"},
-		{"XFF 带空白容忍", "10.0.0.1:1000", " 203.0.113.5 ", "203.0.113.5"},
-		{"IPv6 RemoteAddr", "[2001:db8::1]:443", "", "2001:db8::1"},
+		// 直连（无代理）：始终取 RemoteAddr
+		{"RemoteAddr 提取 host", "192.0.2.10:52341", "", testTrusted, "192.0.2.10"},
+		{"无端口 RemoteAddr 原样", "unix", "", testTrusted, "unix"},
+		{"IPv6 RemoteAddr", "[2001:db8::1]:443", "", nil, "2001:db8::1"},
+
+		// 对端为可信代理：解析 XFF（右起第一个非可信 IP）
+		{"可信代理 + 单段 XFF", "127.0.0.1:1000", "203.0.113.5", testTrusted, "203.0.113.5"},
+		{"可信代理 + 多段 XFF 右起取真实客户端", "127.0.0.1:1000", "spoofed, 203.0.113.5", testTrusted, "203.0.113.5"},
+		{"可信 CIDR 代理 + 双层可信代理链", "10.1.2.3:1000", "203.0.113.5, 10.9.9.9", testTrusted, "203.0.113.5"},
+		{"XFF 带空白容忍", "127.0.0.1:1000", " 203.0.113.5 ", testTrusted, "203.0.113.5"},
+		{"可信代理但 XFF 全为可信代理：取对端", "10.1.2.3:1000", "10.0.0.9", testTrusted, "10.1.2.3"},
+		{"可信代理无 XFF：取对端", "127.0.0.1:1000", "", testTrusted, "127.0.0.1"},
+
+		// 安全关键：对端不可信时伪造 XFF 必须被忽略（IP 白名单绕过防护）
+		{"直连伪造 XFF 被忽略", "203.0.113.99:1000", "127.0.0.1", testTrusted, "203.0.113.99"},
+		{"直连伪造多段 XFF 被忽略", "198.51.100.7:1000", "10.0.0.1, 127.0.0.1", testTrusted, "198.51.100.7"},
+		{"无可信代理配置伪造 XFF 被忽略", "203.0.113.99:1000", "127.0.0.1", nil, "203.0.113.99"},
+
+		// 边界：XFF 混入非法段（跳过，继续向左）
+		{"XFF 非法段跳过", "127.0.0.1:1000", "garbage, 203.0.113.5", testTrusted, "203.0.113.5"},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -36,9 +53,97 @@ func TestClientIP(t *testing.T) {
 		if c.xff != "" {
 			r.Header.Set("X-Forwarded-For", c.xff)
 		}
-		if got := clientIP(r); got != c.want {
+		if got := clientIP(r, c.trusted); got != c.want {
 			t.Errorf("%s: clientIP = %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// ---- rewriteBodyModel（P0：路由/降级切换模型后必须重写 body.model）----
+
+func TestRewriteBodyModel(t *testing.T) {
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"max_tokens":100,"custom_field":{"a":1}}`)
+	out, err := rewriteBodyModel(body, "gpt-4o-mini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "gpt-4o-mini" {
+		t.Fatalf("model = %v, want gpt-4o-mini", m["model"])
+	}
+	// 其余字段原样保留（含未知字段）
+	if m["max_tokens"] != float64(100) {
+		t.Fatalf("max_tokens must be preserved: %v", m["max_tokens"])
+	}
+	if _, ok := m["custom_field"]; !ok {
+		t.Fatal("unknown fields must be preserved")
+	}
+	if _, ok := m["messages"]; !ok {
+		t.Fatal("messages must be preserved")
+	}
+}
+
+func TestRewriteBodyModelInvalidJSON(t *testing.T) {
+	if _, err := rewriteBodyModel([]byte(`{invalid`), "m"); err == nil {
+		t.Fatal("invalid json must error")
+	}
+}
+
+// ---- customerAllowed（客户级密钥绑定校验）----
+
+func TestCustomerAllowed(t *testing.T) {
+	bound := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	other := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	cases := []struct {
+		name              string
+		keyBinding, asked uuid.UUID
+		want              bool
+	}{
+		{"平台级密钥不限制", uuid.Nil, other, true},
+		{"绑定客户一致放行", bound, bound, true},
+		{"绑定客户不一致拒绝", bound, other, false}, // 安全关键：防越权计费
+	}
+	for _, c := range cases {
+		if got := customerAllowed(c.keyBinding, c.asked); got != c.want {
+			t.Errorf("%s: customerAllowed = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// ---- validateChatRequest（入口静态校验）----
+
+func TestValidateChatRequestMaxTokens(t *testing.T) {
+	mk := func(mt int) *chatRequest {
+		return &chatRequest{
+			Messages:  []chatMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+			MaxTokens: &mt,
+		}
+	}
+	if err := validateChatRequest(mk(1000)); err != nil {
+		t.Fatalf("normal max_tokens must pass: %v", err)
+	}
+	if err := validateChatRequest(mk(-1)); err == nil {
+		t.Fatal("negative max_tokens must be rejected")
+	}
+	// 安全关键：天文数字 max_tokens 会让 estimateTokens 的 int64 转换溢出为负，
+	// 绕过 TPM 限流并污染滑动窗口——必须在入口拒绝
+	if err := validateChatRequest(mk(1 << 62)); err == nil {
+		t.Fatal("huge max_tokens must be rejected (TPM bypass via overflow)")
+	}
+	// 恰好上限放行
+	if err := validateChatRequest(mk(maxTokensLimit)); err != nil {
+		t.Fatalf("max_tokens == limit must pass: %v", err)
+	}
+	// 无 max_tokens（nil）与空 messages
+	noMT := &chatRequest{Messages: []chatMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
+	if err := validateChatRequest(noMT); err != nil {
+		t.Fatalf("nil max_tokens must pass: %v", err)
+	}
+	if err := validateChatRequest(&chatRequest{}); err == nil {
+		t.Fatal("empty messages must be rejected")
 	}
 }
 

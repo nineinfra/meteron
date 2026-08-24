@@ -146,6 +146,32 @@ func TestDebugChatRequiresAdminScope(t *testing.T) {
 	}
 }
 
+// 来源地址与 XFF 链必须透传给内部网关请求：
+// 不设置 RemoteAddr（空串）会让带 IP 白名单的密钥在沙盒中必现 403（fail-closed），
+// 且报错文案与真实原因不符，误导排障。
+func TestDebugChatForwardsSourceAddress(t *testing.T) {
+	var gotRemote, gotXFF string
+	gw := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRemote = r.RemoteAddr
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+	})
+	s := newDebugTestServer(gw)
+
+	r := newAdminReq(http.MethodPost, "/api/v1/debug/chat", `{}`)
+	r.RemoteAddr = "203.0.113.10:5555"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+	w := httptest.NewRecorder()
+	s.debugChat(w, r)
+
+	if gotRemote != "203.0.113.10:5555" {
+		t.Fatalf("RemoteAddr not forwarded: %q", gotRemote)
+	}
+	if gotXFF != "198.51.100.7" {
+		t.Fatalf("X-Forwarded-For not forwarded: %q", gotXFF)
+	}
+}
+
 func TestDebugChatGatewayNotWired(t *testing.T) {
 	s := newDebugTestServer(nil) // gateway 未装配
 	w := httptest.NewRecorder()

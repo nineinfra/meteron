@@ -2,16 +2,17 @@ package api
 
 import (
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
 
-// buildAuditQuery：租户强制注入 + 各维度过滤 + 参数化防注入。
+// buildAuditQuery：租户强制注入 + 各维度过滤 + $N 参数化防注入。
 
 func TestBuildAuditQueryTenantAlwaysInjected(t *testing.T) {
 	sql, args := buildAuditQuery(AuditFilter{TenantID: "11111111-1111-1111-1111-111111111111"})
-	if !strings.Contains(sql, "tenant_id = {tenant:UUID}") {
+	if !strings.Contains(sql, "tenant_id = toUUID($1)") {
 		t.Fatalf("sql must enforce tenant filter: %s", sql)
 	}
 	if len(args) == 0 || args[0] != "11111111-1111-1111-1111-111111111111" {
@@ -40,14 +41,15 @@ func TestBuildAuditQueryAllFilters(t *testing.T) {
 		Offset:     10,
 	})
 	for _, cond := range []string{
-		"customer_id = {customer:UUID}",
-		"task_type = {task_type:String}",
-		"agent_id = {agent_id:String}",
-		"model = {model:String}",
-		"provider = {provider:String}",
-		"status_code = {status_code:UInt16}",
-		"event_time >= {from:DateTime64(3)}",
-		"event_time <= {to:DateTime64(3)}",
+		"tenant_id = toUUID($1)",
+		"customer_id = toUUID($2)",
+		"task_type = $3",
+		"agent_id = $4",
+		"model = $5",
+		"provider = $6",
+		"status_code = $7",
+		"event_time >= $8",
+		"event_time <= $9",
 	} {
 		if !strings.Contains(sql, cond) {
 			t.Errorf("missing condition %q in: %s", cond, sql)
@@ -61,14 +63,49 @@ func TestBuildAuditQueryAllFilters(t *testing.T) {
 	if len(args) != 11 {
 		t.Fatalf("args count = %d, want 11: %v", len(args), args)
 	}
-	if !strings.Contains(sql, "LIMIT {limit:UInt32} OFFSET {offset:UInt32}") {
-		t.Error("limit/offset must be parameterized")
+	if !strings.Contains(sql, "LIMIT $10 OFFSET $11") {
+		t.Errorf("limit/offset must be parameterized: %s", sql)
 	}
 	if !strings.Contains(sql, "FROM meter_events FINAL") {
 		t.Error("must query meter_events FINAL")
 	}
 	if !strings.Contains(sql, "ORDER BY event_time DESC") {
 		t.Error("must order by event_time DESC")
+	}
+}
+
+// 回归测试：clickhouse-go v2 纯位置参数只绑定 $N / ? 占位符，命名 {name:Type}
+// 占位符的参数会被静默丢弃、占位符原样发给服务端导致语法错误（P0 修复）。
+// SQL 必须不含命名占位符，且 $N 序号与 args 数量严格一致。
+func TestBuildAuditQueryPositionalBindingContract(t *testing.T) {
+	sql, args := buildAuditQuery(AuditFilter{
+		TenantID:   "11111111-1111-1111-1111-111111111111",
+		CustomerID: "22222222-2222-2222-2222-222222222222",
+		Model:      "gpt-4",
+		StatusCode: 429,
+	})
+	if strings.Contains(sql, "{") {
+		t.Fatalf("named placeholder leaked (clickhouse-go drops args for it): %s", sql)
+	}
+	// 提取全部 $N 引用，校验序号连续且不超过参数总数
+	refRe := regexp.MustCompile(`\$(\d+)`)
+	refs := refRe.FindAllStringSubmatch(sql, -1)
+	seen := map[int]bool{}
+	for _, m := range refs {
+		n := 0
+		for _, c := range m[1] {
+			n = n*10 + int(c-'0')
+		}
+		if n < 1 || n > len(args) {
+			t.Fatalf("$%d out of range (args=%d): %s", n, len(args), sql)
+		}
+		seen[n] = true
+	}
+	// 每个参数都必须被引用（防参数错位/遗漏）
+	for i := 1; i <= len(args); i++ {
+		if !seen[i] {
+			t.Fatalf("arg %d never referenced in SQL: %s", i, sql)
+		}
 	}
 }
 
@@ -90,7 +127,7 @@ func TestBuildAuditQueryLimitClamped(t *testing.T) {
 	}
 }
 
-// 值全部走命名参数绑定，SQL 文本不拼接用户输入（防注入）。
+// 值全部走 $N 参数绑定，SQL 文本不拼接用户输入（防注入）。
 func TestBuildAuditQueryNoInlineValues(t *testing.T) {
 	sql, _ := buildAuditQuery(AuditFilter{
 		TenantID: "11111111-1111-1111-1111-111111111111",
@@ -149,6 +186,10 @@ func TestParseAuditFilterValidation(t *testing.T) {
 		"status_code=70000",
 		"from=not-a-date",
 		"to=2026/08/24",
+		// customer_id 非法 UUID：必须在入口 400，交由 ClickHouse toUUID()
+		// 解析会变成 500 INTERNAL_ERROR（用户输入错误被归为服务端故障）
+		"customer_id=not-a-uuid",
+		"customer_id=12345",
 	}
 	for _, q := range cases {
 		r := httptest.NewRequest("GET", "/api/v1/audit/events?"+q, nil)

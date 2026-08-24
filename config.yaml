@@ -17,6 +17,8 @@ redis_addr: "localhost:6379"
 aes_key: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 # 首次启动引导 API Key（明文，仅初始化用；生产环境启动后应轮换）
 bootstrap_api_key: "mk_meteron_bootstrap_dev_key"
+# 本地开发样例显式豁免内置默认密钥（源码公开值，生产部署必须替换上面两项并删除本行）
+insecure_defaults: true
 
 providers:
   # 默认模型：本地 Ollama 的 qwen3.5:9b（先 ollama pull qwen3.5:9b）

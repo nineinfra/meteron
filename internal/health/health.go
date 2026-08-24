@@ -170,12 +170,29 @@ func (t *Tracker) Enable(provider string) {
 }
 
 // Snapshot 全部渠道健康快照。
+// 遍历 samples ∪ manual ∪ auto：只看 samples 会让"从未有流量的渠道"
+// （如刚配置、或探测未启动时被人工禁用）从管理列表中消失，
+// 运维禁用后在列表里找不到该渠道、无法查看/恢复其状态。
 func (t *Tracker) Snapshot() []ProviderHealth {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	seen := make(map[string]bool, len(t.samples))
 	out := make([]ProviderHealth, 0, len(t.samples))
-	for provider := range t.samples {
-		out = append(out, t.snapshotOneLocked(provider))
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, t.snapshotOneLocked(p))
+	}
+	for p := range t.samples {
+		add(p)
+	}
+	for p := range t.manual {
+		add(p)
+	}
+	for p := range t.auto {
+		add(p)
 	}
 	return out
 }
@@ -203,6 +220,9 @@ func (t *Tracker) snapshotOneLocked(provider string) ProviderHealth {
 }
 
 // exportLocked 同步 Prometheus 指标（Gauge Set 成本低，随状态变更即时更新）。
+// provider_disabled 的三个 reason 变体全部写入（当前 reason=1、其余=0）：
+// 只写当前 reason 会在标签切换（如 auto → none）后遗留旧序列恒为 1，
+// 导致 provider_disabled == 1 类告警永久误报（Prometheus 不回收已导出序列）。
 func (t *Tracker) exportLocked(provider string) {
 	st := t.statsLocked(provider, t.now())
 	metrics.ProviderHealthErrorRate.WithLabelValues(provider).Set(st.errorRate)
@@ -213,7 +233,13 @@ func (t *Tracker) exportLocked(provider string) {
 	} else if t.manual[provider] {
 		reason = "manual"
 	}
-	metrics.ProviderDisabled.WithLabelValues(provider, reason).Set(map[bool]float64{true: 1, false: 0}[reason != "none"])
+	for _, r := range [...]string{"none", "auto", "manual"} {
+		var v float64
+		if r == reason {
+			v = 1
+		}
+		metrics.ProviderDisabled.WithLabelValues(provider, r).Set(v)
+	}
 }
 
 // ---- 主动探测 ----

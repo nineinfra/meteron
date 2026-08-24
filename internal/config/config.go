@@ -3,7 +3,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -38,6 +40,17 @@ type Health struct {
 	MinSamples         int64        `yaml:"min_samples"`         // 触发自动禁用的最小样本数（防小样本误杀）
 }
 
+// Security 安全配置。
+type Security struct {
+	// TrustedProxies 可信反向代理地址（单 IP 或 CIDR）。
+	// 仅当请求直连对端命中该列表时才解析 X-Forwarded-For 提取真实客户端 IP
+	// （从右向左跳过可信代理段）；对端不可信时忽略 XFF——XFF 可被任意客户端
+	// 伪造，直接取首段会被密钥 IP 白名单绕过。
+	// 默认信任本机回环（内置控制台反代的默认部署形态）；
+	// 直接对外暴露 API 端点时应清空（env 设为 none）。
+	TrustedProxies []string `yaml:"trusted_proxies"`
+}
+
 type Business struct {
 	EventLookbackWindowDays  int           `yaml:"event_lookback_window_days"`  // 晚到事件回溯窗口，默认34天
 	ReserveDefaultTTLSeconds int           `yaml:"reserve_default_ttl_seconds"` // 预留默认TTL，默认60s
@@ -63,11 +76,22 @@ type Config struct {
 	RedisAddr     string           `yaml:"redis_addr"`
 	AESKey        string           `yaml:"aes_key"`           // 32字节 hex，API Key 哈希（HMAC-SHA256）的 pepper
 	BootstrapKey  string           `yaml:"bootstrap_api_key"` // 首次启动引导 API Key（明文，仅用于初始化）
-	Providers     []ProviderConfig `yaml:"providers"`
-	Business      Business         `yaml:"business"`
-	RateLimit     RateLimit        `yaml:"rate_limit"`
-	Health        Health           `yaml:"health"`
+	// InsecureDefaults 显式允许使用源码内置默认密钥（仅限本地开发环境）。
+	// 默认 false：内置默认 aes_key/bootstrap key 已随源码公开，任何可达实例都可
+	// 凭公开凭据获得 admin 权限（CWE-798），生产部署必须替换两者。
+	InsecureDefaults bool             `yaml:"insecure_defaults"`
+	Providers        []ProviderConfig `yaml:"providers"`
+	Business         Business         `yaml:"business"`
+	RateLimit        RateLimit        `yaml:"rate_limit"`
+	Health           Health           `yaml:"health"`
+	Security         Security         `yaml:"security"`
 }
+
+// 内置默认密钥（源码公开值，validate 拦截 + insecure_defaults 显式豁免）
+const (
+	defaultAESKeyHex    = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	defaultBootstrapKey = "mk_meteron_bootstrap_dev_key"
+)
 
 func Default() *Config {
 	c := &Config{}
@@ -78,8 +102,8 @@ func Default() *Config {
 	c.KafkaBrokers = []string{"localhost:9092"}
 	c.KafkaTopic = "meteron.meter-events"
 	c.RedisAddr = "localhost:6379"
-	c.AESKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-	c.BootstrapKey = "mk_meteron_bootstrap_dev_key"
+	c.AESKey = defaultAESKeyHex
+	c.BootstrapKey = defaultBootstrapKey
 	c.Business.EventLookbackWindowDays = 34
 	c.Business.ReserveDefaultTTLSeconds = 60
 	c.Business.EstimateUnitPrice = "0.000002"
@@ -98,6 +122,8 @@ func Default() *Config {
 	c.Health.Window = 5 * time.Minute
 	c.Health.ErrorRateThreshold = 0.5
 	c.Health.MinSamples = 10
+	// 默认仅信任本机回环（内置控制台反代默认部署形态）；直接暴露 API 端点时清空
+	c.Security.TrustedProxies = []string{"127.0.0.1", "::1"}
 	c.Providers = []ProviderConfig{
 		// 默认模型：本机 Ollama 的 qwen3.5:9b（OpenAI 兼容端点，api_key 留空）。
 		// 容器内经 host.docker.internal 访问宿主机 Ollama；宿主机直跑时由 config.yaml 覆盖为 localhost。
@@ -116,10 +142,18 @@ func Load() (*Config, error) {
 	if path == "" {
 		path = "config.yaml"
 	}
-	if data, err := os.ReadFile(path); err == nil {
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
 		if err := yaml.Unmarshal(expandEnv(data), c); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
 		}
+	case errors.Is(err, fs.ErrNotExist):
+		// 配置文件不存在：维持"存在才加载"语义（纯 env 部署形态）
+	default:
+		// 路径拼错/权限等读取错误：静默回退默认值会让服务带着公开的默认
+		// 密钥与默认中间件地址启动且无任何提示，必须直接失败
+		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 
 	applyEnv(c)
@@ -161,6 +195,9 @@ func applyEnv(c *Config) {
 	set("METERON_REDIS_ADDR", func(v string) { c.RedisAddr = v })
 	set("METERON_AES_KEY", func(v string) { c.AESKey = v })
 	set("METERON_BOOTSTRAP_API_KEY", func(v string) { c.BootstrapKey = v })
+	set("METERON_INSECURE_DEFAULTS", func(v string) {
+		c.InsecureDefaults = v == "true" || v == "1"
+	})
 	set("METERON_SERVER_ADDR", func(v string) { c.Server.Addr = v })
 	set("METERON_CONSOLE_ADDR", func(v string) { c.Server.ConsoleAddr = v })
 	set("METERON_EVENT_LOOKBACK_WINDOW_DAYS", func(v string) {
@@ -205,6 +242,14 @@ func applyEnv(c *Config) {
 		}
 	})
 	setInt("METERON_HEALTH_MIN_SAMPLES", func(n int64) { c.Health.MinSamples = n })
+	// 可信代理列表：逗号分隔 IP/CIDR；none=清空（直接对外暴露 API 端点时使用）
+	set("METERON_TRUSTED_PROXIES", func(v string) {
+		if v == "none" {
+			c.Security.TrustedProxies = nil
+			return
+		}
+		c.Security.TrustedProxies = strings.Split(v, ",")
+	})
 }
 
 func validate(c *Config) error {
@@ -216,6 +261,14 @@ func validate(c *Config) error {
 	}
 	if len(c.AESKey) != 64 {
 		return fmt.Errorf("aes_key 必须为 64 位 hex 字符串（32字节）")
+	}
+	// 内置默认密钥保护（CWE-798）：默认 aes_key / bootstrap key 已随源码公开，
+	// 任何可达实例都可凭公开凭据获得 admin 权限（含密钥管理、账单、调试沙盒）。
+	// 使用默认值必须显式声明 insecure_defaults（本地开发）；生产部署务必替换两者。
+	if (c.AESKey == defaultAESKeyHex || c.BootstrapKey == defaultBootstrapKey) && !c.InsecureDefaults {
+		return fmt.Errorf("检测到源码内置默认密钥（aes_key/bootstrap_api_key），存在公开凭据风险：" +
+			"请通过 METERON_AES_KEY / METERON_BOOTSTRAP_API_KEY（或 yaml）替换；" +
+			"本地开发可显式设置 insecure_defaults: true 或 METERON_INSECURE_DEFAULTS=true 豁免")
 	}
 	if c.Business.EventLookbackWindowDays <= 0 {
 		c.Business.EventLookbackWindowDays = 34

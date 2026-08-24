@@ -139,6 +139,16 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			writeErr(w, common.ErrUnauthorized.Wrap(err))
 			return
 		}
+		// IP 白名单：管理面与网关一致强制——否则配置了"仅内网 IP"的密钥
+		// 泄漏后仍可从公网调用管理 API（含密钥管理、账单、调试沙盒），第二道防线失效。
+		var trustedProxies []string
+		if s.cfg != nil {
+			trustedProxies = s.cfg.Security.TrustedProxies
+		}
+		if !rbac.IPAllowed(ident.IPWhitelist, rbac.ClientIP(r, trustedProxies)) {
+			writeErr(w, common.ErrIPNotAllowed.Wrap(errors.New("source ip not in key whitelist")))
+			return
+		}
 		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), ident)))
 	})
 }

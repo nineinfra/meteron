@@ -164,3 +164,85 @@ go test ./...    # 含新增 rbac / ingest / store 三个测试文件
 双轨对账等商业计费系统的关键模式均正确落地；在线/离线分离与全链路幂等是最大架构
 亮点。本轮修复解决了鉴权可逆性与事件持久化两个阻断生产使用的问题，并打通了迁移
 体系的最后一公里。建议按 §5 顺序推进 P2 项。
+
+---
+
+# 第二轮评审（feature/competitive-features 分支）
+
+> 评审日期：2026-08-24（第二轮）
+> 评审范围：五项竞品能力实现（密钥治理 / 渠道健康 / 双重限流 / 审计查询 / 调试沙盒）
+> 及其全链路交叉验证（rbac / ratelimit / health / api / gateway / config / main / 前端）
+> 结论：发现 P0 × 3、P1 × 8，已全部修复并补充回归测试；遗留项见 §7。
+
+## 7. 问题清单与修复记录（第二轮）
+
+### P0 — 路由/降级切换模型后请求体 model 未重写（已修复）
+
+**位置**：`internal/gateway/handler.go` + `internal/provider/openai.go`
+
+**问题**：路由规则 target_model 覆盖、预算降级、健康禁用 fallback 切换模型后，
+OpenAI 兼容适配器仍把客户端原始 body 原样 POST（`req.Model` 从未写入 body）。
+后果：① fallback 渠道不承载原模型时上游直接 404，降级路由形同虚设；
+② 目标渠道同时承载两模型时，实际执行 A 模型、按 B 模型费率计费——计量数据
+"自洽地错"，对账无法发现。
+
+**修复**：转发前 `rewriteBodyModel`（`map[string]json.RawMessage` 保留其余字段）
+重写 body.model；回归测试 `TestRewriteBodyModel` 断言字段保留与非法 body 拒绝。
+
+### P0 — 客户级密钥可把用量计费到任意同租户客户（已修复）
+
+**位置**：`internal/gateway/handler.go`（`ident.CustomerID` 全文未被引用）
+
+**问题**：密钥支持绑定客户（`Identity.CustomerID`），管理 API 侧已强制隔离
+（`identity.go`/`usage.go`），但计费热路径的 customerID 完全由请求头
+`X-Meteron-Customer-ID` 决定——持有客户 A 密钥者传 B 的 ID 即可污染 B 的
+预算池与账单（越权计费）。
+
+**修复**：`resolveCustomer` 后强制 `customerAllowed` 校验（绑定客户不一致 →
+403 `CUSTOMER_NOT_ALLOWED`，新增错误码 1017）；测试 `TestCustomerAllowed`。
+
+### P0 — 内置默认密钥随源码公开（CWE-798，已修复）
+
+**位置**：`internal/config/config.go`（默认 AESKey/BootstrapKey）、`web/src/App.vue`、
+`deploy/docker-compose.yml`
+
+**问题**：默认 `bootstrap_api_key=mk_meteron_bootstrap_dev_key`（admin scope）
+与 pepper 均为源码公开值；照抄 compose 启动即向任何知道仓库的人开放全部管理 API。
+前端引导页还明文展示该默认密钥。
+
+**修复**：`validate()` 检测默认密钥即拒绝启动，须显式豁免（yaml
+`insecure_defaults: true` 或 env `METERON_INSECURE_DEFAULTS=true`，本地开发栈
+与 config.yaml 已显式声明）；`Load()` 同时修复静默吞掉配置文件读取错误（仅
+ErrNotExist 维持"存在才加载"）；前端移除默认密钥文案；新增 `config_test.go`
+覆盖拦截/豁免/自定义密钥/读取错误四类路径。
+
+### P1（已修复，摘要）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | `max_tokens` 无上限 → `estimateTokens` int64 溢出为负绕过 TPM 并污染窗口 | 入口校验 `[0, 1_000_000]`（`validateChatRequest`）+ 测试 |
+| 2 | 管理 API 不检查密钥 IP 白名单（第二道防线整体绕过） | `authMiddleware` 复用 `rbac.ClientIP`+`IPAllowed`（实现下沉 rbac，网关/管理面同源） |
+| 3 | `key_hash` 无索引：鉴权热路径全表扫描 | 迁移 `005` 唯一索引（同时兜底 Bootstrap 并发重复插入） |
+| 4 | 调试沙盒内部请求无 `RemoteAddr`：带 IP 白名单的密钥必现 403 | 透传 `RemoteAddr` 与 XFF 链 + 测试 |
+| 5 | 审计查询 `rows.Err()` 未检查：出错返回 200+静默截断数据 | 迭代后显式检查 |
+| 6 | `customer_id` 非法 UUID → ClickHouse `toUUID()` 抛错变 500 | 入口 `uuid.Parse` 校验 → 400 |
+| 7 | `expire_at` 带非零偏移实际失效点偏移数小时（TIMESTAMP 无时区列） | 解析后统一 `.UTC()` |
+| 8 | 健康列表只遍历 samples：人工禁用的无流量渠道"消失" | `Snapshot` 取 samples ∪ manual ∪ auto + 测试 |
+
+### 修复验证
+
+`go build ./...`、`go vet ./...`、`go test ./...` 全部通过（含新增 config /
+gateway / api / health 测试用例）。
+
+## 8. 遗留风险（第二轮，建议后续处理）
+
+| # | 问题 | 说明 | 建议 |
+|---|---|---|---|
+| 1 | Redis 限流 Lua 滑动窗口 O(N) 全量遍历 | 每次.AllowRate 在 Lua 内 `ZRANGE 0 -1`+逐成员 HGET，高限额时限流器自身成为 Redis 瓶颈（O(N²) 总复杂度） | 改 HASH 累加器/分桶计数；引入 miniredis 补 Redis 实现的语义测试（当前仅 Memory 实现有测试） |
+| 2 | Redis 并发信号量 TTL 10 分钟不续期 | 超长流式请求持有期过期 → 计数清零超发，旧持有者 release 会吞掉新计数 | release 带持有者 token（集合信号量）或每次 Acquire 续期 |
+| 3 | `writeErr` 向客户端透出内部错误 detail | PG/CH 错误文本（含 SQL/约束名）直接进响应；仅 admin 可达，风险低 | 5xx 类 detail 记日志、对外固定文案 |
+| 4 | `requireScope` 权限不足返回 401 而非 403 | RFC 语义偏差，测试已把 401 固化为契约 | 统一为 403 并同步测试 |
+| 5 | admin 密钥明文存 localStorage | 无 HttpOnly 保护，一旦引入 XSS 即凭据失窃 | 内存态保存或后端签发短期 session token |
+| 6 | 幂等键占用不区分预留状态 | released/expired 的同键重试永远 409，与常见幂等语义（成功前可重试）相悖 | 仅 pending/confirmed 视为占用（唯一约束改部分索引） |
+| 7 | `from` 可传 1970 年绕过 24h 默认窗口 | FINAL+跨全分区扫描代价高；audit 排序缺 event_id 次级键，OFFSET 翻页在时间并列处可能重复/漏行 | 校验 from≤to、限制最大跨度；`ORDER BY event_time, event_id` |
+| 8 | mock 渠道探测样本稀释错误率 | BaseURL 为空的渠道每 interval 注入成功样本，真实流量 100% 失败时混合探测可能低于阈值，延迟自动禁用 | 探测样本与真实流量分桶统计 |

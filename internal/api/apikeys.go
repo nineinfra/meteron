@@ -63,6 +63,10 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, errBadRequest("invalid expire_at (RFC3339 required)"))
 			return
 		}
+		// DB 列为无时区 TIMESTAMP：pgx 按 time 自身时区的墙钟编码、丢弃偏移，
+		// 而 NOW() 按 DB 会话时区（UTC）求值——带非零偏移的输入统一转 UTC，
+		// 否则实际失效点可比预期晚数小时（如 +08:00 输入晚 8 小时）
+		t = t.UTC()
 		opts.ExpireAt = &t
 	}
 

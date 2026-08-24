@@ -120,6 +120,45 @@ func TestTrackerManualDisableAndEnable(t *testing.T) {
 	}
 }
 
+// 无流量渠道（从未 Observe/探测）被人工禁用后必须仍出现在 Snapshot 列表中：
+// 只遍历 samples 会让运维刚禁用的冷渠道"消失"，无法查看/恢复其状态。
+func TestSnapshotIncludesDisabledColdProvider(t *testing.T) {
+	tr, _ := newTestTracker()
+	// "warm" 有流量；"cold" 只有禁用状态、无任何样本
+	tr.Observe("warm", true, time.Millisecond)
+	tr.Disable("cold")
+
+	got := tr.Snapshot()
+	byName := map[string]ProviderHealth{}
+	for _, h := range got {
+		byName[h.Provider] = h
+	}
+	cold, ok := byName["cold"]
+	if !ok {
+		t.Fatalf("manually disabled cold provider missing from snapshot: %+v", got)
+	}
+	if !cold.Disabled || cold.AutoDisabled {
+		t.Fatalf("cold provider state = %+v, want disabled=true auto=false", cold)
+	}
+	if _, ok := byName["warm"]; !ok {
+		t.Fatal("warm provider must still be present")
+	}
+	// 恢复后仍在列表（状态为启用）
+	tr.Enable("cold")
+	found := false
+	for _, h := range tr.Snapshot() {
+		if h.Provider == "cold" {
+			found = true
+			if h.Disabled {
+				t.Fatal("cold provider must be enabled after Enable")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("cold provider must remain in snapshot after Enable")
+	}
+}
+
 func TestTrackerWindowSliding(t *testing.T) {
 	tr, now := newTestTracker()
 	// t0：4 次失败 → 自动禁用；随后人工恢复

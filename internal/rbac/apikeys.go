@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -31,7 +32,7 @@ const ScopeIngest = "ingest"
 // Identity 鉴权后的调用方身份。
 type Identity struct {
 	TenantID       uuid.UUID
-	CustomerID     uuid.UUID // 可为 nil（平台级密钥）
+	CustomerID     uuid.UUID // 零值 = 平台级密钥（不绑定客户）；非零 = 客户级密钥
 	KeyID          uuid.UUID
 	Scopes         []string
 	IPWhitelist    []string // IP 白名单（空=不限制；元素支持单 IP 与 CIDR）
@@ -363,6 +364,40 @@ func ModelAllowed(allowList []string, model string) bool {
 		}
 	}
 	return false
+}
+
+// ClientIP 提取来源 IP（密钥 IP 白名单的判定依据，网关与管理 API 共用）。
+// 安全语义：X-Forwarded-For 可被任意客户端伪造——仅当请求直连对端
+// （RemoteAddr）命中可信代理列表时才解析 XFF，且从右向左跳过可信代理段，
+// 取第一个不可信 IP 为真实客户端（最近一台可信代理追加的就是真实来源）；
+// 对端不可信时忽略 XFF，直接采用 RemoteAddr。
+// trustedProxies 为空表示不信任任何代理（API 端点直接对外暴露）。
+func ClientIP(r *http.Request, trustedProxies []string) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if len(trustedProxies) == 0 {
+		return host
+	}
+	if !IPAllowed(trustedProxies, host) {
+		return host // 对端不是可信代理：XFF 全部不可信
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return host
+	}
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ipStr := strings.TrimSpace(parts[i])
+		if net.ParseIP(ipStr) == nil {
+			continue // 跳过非法段
+		}
+		if !IPAllowed(trustedProxies, ipStr) {
+			return ipStr // 右起第一个非可信 IP = 真实客户端
+		}
+	}
+	return host // XFF 全为可信代理：取对端地址
 }
 
 func randomBytes(n int) []byte {

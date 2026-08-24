@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/meteron/meteron/internal/common"
 )
 
@@ -43,46 +45,46 @@ type auditEventView struct {
 	EventTime     time.Time         `json:"event_time"`
 }
 
-// buildAuditQuery 构造 ClickHouse 审计查询（参数化，防注入）。
+// buildAuditQuery 构造 ClickHouse 审计查询（$N 位置参数化，防注入）。
 // 返回 SQL 与位置参数；tenant 强制注入（租户隔离不可绕过）。
+//
+// 绑定约定（与 internal/meter/usage.go 既有用法一致）：clickhouse-go v2 的
+// 纯位置参数只绑定 $N / ? 占位符——命名 {name:Type} 占位符需 clickhouse.Named
+// 传参，否则参数被静默丢弃、占位符原样发给服务端导致语法错误。
+// UUID 列比较必须 toUUID($N) 包裹（字符串参数格式化为带引号字面量）。
 func buildAuditQuery(f AuditFilter) (string, []interface{}) {
 	var where []string
 	args := []interface{}{}
 
-	where = append(where, "tenant_id = {tenant:UUID}")
-	args = append(args, f.TenantID)
+	add := func(condFmt string, v interface{}) {
+		where = append(where, fmt.Sprintf(condFmt, len(args)+1))
+		args = append(args, v)
+	}
 
+	add("tenant_id = toUUID($%d)", f.TenantID)
 	if f.CustomerID != "" {
-		where = append(where, "customer_id = {customer:UUID}")
-		args = append(args, f.CustomerID)
+		add("customer_id = toUUID($%d)", f.CustomerID)
 	}
 	if f.TaskType != "" {
-		where = append(where, "task_type = {task_type:String}")
-		args = append(args, f.TaskType)
+		add("task_type = $%d", f.TaskType)
 	}
 	if f.AgentID != "" {
-		where = append(where, "agent_id = {agent_id:String}")
-		args = append(args, f.AgentID)
+		add("agent_id = $%d", f.AgentID)
 	}
 	if f.Model != "" {
-		where = append(where, "model = {model:String}")
-		args = append(args, f.Model)
+		add("model = $%d", f.Model)
 	}
 	if f.Provider != "" {
-		where = append(where, "provider = {provider:String}")
-		args = append(args, f.Provider)
+		add("provider = $%d", f.Provider)
 	}
 	if f.StatusCode > 0 {
-		where = append(where, "status_code = {status_code:UInt16}")
-		args = append(args, f.StatusCode)
+		add("status_code = $%d", f.StatusCode)
 	}
 	if !f.From.IsZero() {
-		where = append(where, "event_time >= {from:DateTime64(3)}")
-		args = append(args, f.From)
+		add("event_time >= $%d", f.From)
 	}
 	if !f.To.IsZero() {
-		where = append(where, "event_time <= {to:DateTime64(3)}")
-		args = append(args, f.To)
+		add("event_time <= $%d", f.To)
 	}
 
 	limit := f.Limit
@@ -93,14 +95,15 @@ func buildAuditQuery(f AuditFilter) (string, []interface{}) {
 		limit = 1000
 	}
 
+	// limit/offset 为 args 末尾两位（WHERE 条件参数之后）
 	sql := fmt.Sprintf(`
 SELECT event_id, transaction_id, customer_id, task_type, agent_id, provider, model,
        input_tokens, output_tokens, cached_input_tokens, status_code, currency, metadata, event_time
 FROM meter_events FINAL
 WHERE %s
 ORDER BY event_time DESC
-LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
-		strings.Join(where, " AND "))
+LIMIT $%d OFFSET $%d`,
+		strings.Join(where, " AND "), len(args)+1, len(args)+2)
 	args = append(args, limit, f.Offset)
 	return sql, args
 }
@@ -110,7 +113,14 @@ func parseAuditFilter(r *http.Request, tenantID string) (AuditFilter, error) {
 	q := r.URL.Query()
 	f := AuditFilter{TenantID: tenantID}
 
-	f.CustomerID = q.Get("customer_id")
+	if v := q.Get("customer_id"); v != "" {
+		// 提前校验 UUID：非法值交由 ClickHouse toUUID() 解析会变成 500，
+		// 用户输入错误应归为 400
+		if _, err := uuid.Parse(v); err != nil {
+			return f, fmt.Errorf("invalid customer_id %q (uuid required)", v)
+		}
+		f.CustomerID = v
+	}
 	f.TaskType = q.Get("task_type")
 	f.AgentID = q.Get("agent_id")
 	f.Model = q.Get("model")
@@ -188,6 +198,13 @@ func (s *Server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, v)
+	}
+	// rows 迭代中途出错（网络中断/context 取消/解码失败）时 Next() 返回 false
+	// 但错误只存在 rows.Err() 中——不检查会返回 200 + 静默截断的部分数据，
+	// 审计排障场景下"部分数据"比报错更危险
+	if err := rows.Err(); err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
 	}
 	writeOK(w, map[string]interface{}{
 		"events": out,

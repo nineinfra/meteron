@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -97,7 +96,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1.5 密钥 IP 白名单（空名单不限制；fail-closed：有名单但来源 IP 不可解析则拒绝）
-	if !rbac.IPAllowed(ident.IPWhitelist, clientIP(r)) {
+	var trustedProxies []string
+	if h.cfg != nil {
+		trustedProxies = h.cfg.Security.TrustedProxies
+	}
+	if !rbac.IPAllowed(ident.IPWhitelist, clientIP(r, trustedProxies)) {
 		writeErr(w, common.ErrIPNotAllowed.Wrap(errors.New("source ip not in key whitelist")))
 		return
 	}
@@ -122,8 +125,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, common.ErrBadRequest.Wrap(errors.New("invalid chat request body")))
 		return
 	}
-	if len(chatReq.Messages) == 0 {
-		writeErr(w, common.ErrBadRequest.Wrap(errors.New("messages required")))
+	if err := validateChatRequest(&chatReq); err != nil {
+		writeErr(w, common.ErrBadRequest.Wrap(err))
 		return
 	}
 
@@ -131,6 +134,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	customerID, err := h.resolveCustomer(ctx, ident.TenantID, customerIDStr)
 	if err != nil {
 		writeErr(w, err)
+		return
+	}
+	// 3.1 密钥客户绑定：客户级密钥只能以绑定客户身份调用
+	// （防持有客户 A 密钥者把用量/预算/账单记到同租户客户 B 头上，越权计费）
+	if !customerAllowed(ident.CustomerID, customerID) {
+		writeErr(w, common.ErrCustomerNotAllowed.Wrap(errors.New("key bound to another customer")))
 		return
 	}
 
@@ -285,6 +294,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 9. 转发 LLM
+	// 9.1 路由/降级切换模型后重写请求体 model 字段：上游按 body.model 实际执行，
+	// 不重写会导致转发模型与定价/白名单校验模型不一致（按 B 模型费率给 A 模型计费），
+	// 且 fallback 渠道不承载原模型时上游直接 404/400，降级路由形同虚设。
+	if route.Model != chatReq.Model {
+		if body, err = rewriteBodyModel(body, route.Model); err != nil {
+			if reservation != nil {
+				_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
+			}
+			writeErr(w, common.ErrBadRequest.Wrap(err))
+			return
+		}
+	}
 	w.Header().Set("X-Meteron-Transaction-ID", txnID.String())
 	if reservation != nil {
 		w.Header().Set("X-Meteron-Reservation-ID", reservation.ID.String())
@@ -393,6 +414,43 @@ type chatRequest struct {
 	Stream      bool            `json:"stream"`
 }
 
+// maxTokensLimit max_tokens 合法上限：拒绝天文数字（如 MaxInt64 会让
+// estimateTokens 的 int64 转换溢出为负值，从而绕过 TPM 限流并污染滑动窗口）。
+// 主流 LLM 上游的实际上限远低于此值。
+const maxTokensLimit = 1_000_000
+
+// validateChatRequest 网关入口请求静态校验。
+func validateChatRequest(req *chatRequest) error {
+	if len(req.Messages) == 0 {
+		return errors.New("messages required")
+	}
+	if req.MaxTokens != nil && (*req.MaxTokens < 0 || *req.MaxTokens > maxTokensLimit) {
+		return fmt.Errorf("max_tokens must be in [0, %d]", maxTokensLimit)
+	}
+	return nil
+}
+
+// customerAllowed 客户级密钥绑定校验：零值 = 平台级密钥（不限制），
+// 否则请求头指定的客户必须与密钥绑定客户一致（计费归属完整性）。
+func customerAllowed(keyBinding, requested uuid.UUID) bool {
+	return keyBinding == uuid.Nil || keyBinding == requested
+}
+
+// rewriteBodyModel 路由/降级切换模型后重写请求体 model 字段。
+// 用 map[string]json.RawMessage 反序列化可保留其余字段原样（不丢未知字段、不改写格式）。
+func rewriteBodyModel(body []byte, model string) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("rewrite body model: %w", err)
+	}
+	mb, err := json.Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	m["model"] = json.RawMessage(mb)
+	return json.Marshal(m)
+}
+
 type chatMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
@@ -443,19 +501,10 @@ func (h *Handler) estimateTokens(req *chatRequest) uint64 {
 	return estTokens + uint64(maxTok)
 }
 
-// clientIP 提取来源 IP：优先 X-Forwarded-For 首段（反代场景），否则 RemoteAddr。
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+// clientIP 提取来源 IP（密钥 IP 白名单的判定依据）。
+// 实现位于 rbac.ClientIP（与管理 API 共用同一可信代理语义），此处保留薄封装供本包调用。
+func clientIP(r *http.Request, trustedProxies []string) string {
+	return rbac.ClientIP(r, trustedProxies)
 }
 
 // 客户维度限流 key（Redis 键空间：rl = rate limit）

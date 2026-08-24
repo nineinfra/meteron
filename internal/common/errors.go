@@ -26,6 +26,7 @@ const (
 	CodeRateLimited                    = 1014 // RATE_LIMITED 触发速率限制（RPM/TPM）
 	CodeConcurrencyLimited             = 1015 // CONCURRENCY_LIMITED 触发并发限制
 	CodeKeyDisabled                    = 1016 // KEY_DISABLED 密钥已禁用或过期
+	CodeCustomerNotAllowed             = 1017 // CUSTOMER_NOT_ALLOWED 请求客户与密钥绑定不符
 	CodeInternal                       = 2001 // INTERNAL_ERROR 内部系统异常
 )
 
@@ -71,6 +72,7 @@ var (
 	ErrRateLimited                  = NewBiz(CodeRateLimited, "RATE_LIMITED", http.StatusTooManyRequests)
 	ErrConcurrencyLimited           = NewBiz(CodeConcurrencyLimited, "CONCURRENCY_LIMITED", http.StatusTooManyRequests)
 	ErrKeyDisabled                  = NewBiz(CodeKeyDisabled, "KEY_DISABLED", http.StatusUnauthorized)
+	ErrCustomerNotAllowed           = NewBiz(CodeCustomerNotAllowed, "CUSTOMER_NOT_ALLOWED", http.StatusForbidden)
 	ErrInternal                     = NewBiz(CodeInternal, "INTERNAL_ERROR", http.StatusInternalServerError)
 )
 
