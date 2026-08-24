@@ -107,6 +107,8 @@ func main() {
 		log.Error("init provider registry failed", "err", err)
 		os.Exit(1)
 	}
+	// auto 路由的渠道分级反查（provider.cost_tier）
+	routerEngine.SetLookup(providers)
 	producer := ingest.NewProducer(kafkaWriter, ingest.NewPGOutboxStore(db), log)
 	defer producer.Close()
 

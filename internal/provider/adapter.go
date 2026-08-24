@@ -43,12 +43,19 @@ type Adapter interface {
 
 // Registry Provider 注册表。
 type Registry struct {
-	adapters   map[string]Adapter
-	modelIndex map[string]string // model -> provider name
+	adapters       map[string]Adapter
+	modelIndex     map[string]string     // model -> provider name
+	tierIndex      map[string][]string   // cost_tier -> provider names（配置顺序即优先顺序）
+	providerModels map[string][]string   // provider -> models（配置顺序）
 }
 
 func NewRegistry(cfgs []config.ProviderConfig, timeout time.Duration) (*Registry, error) {
-	r := &Registry{adapters: map[string]Adapter{}, modelIndex: map[string]string{}}
+	r := &Registry{
+		adapters:       map[string]Adapter{},
+		modelIndex:     map[string]string{},
+		tierIndex:      map[string][]string{},
+		providerModels: map[string][]string{},
+	}
 	for _, c := range cfgs {
 		var a Adapter
 		switch c.Type {
@@ -70,8 +77,12 @@ func NewRegistry(cfgs []config.ProviderConfig, timeout time.Duration) (*Registry
 			return nil, fmt.Errorf("provider %s: 未知类型 %q", c.Name, c.Type)
 		}
 		r.adapters[c.Name] = a
+		r.providerModels[c.Name] = append([]string{}, c.Models...)
 		for _, m := range c.Models {
 			r.modelIndex[m] = c.Name
+		}
+		if c.CostTier != "" {
+			r.tierIndex[c.CostTier] = append(r.tierIndex[c.CostTier], c.Name)
 		}
 	}
 	return r, nil
@@ -87,4 +98,18 @@ func (r *Registry) Get(name string) (Adapter, bool) {
 func (r *Registry) ProviderForModel(model string) (string, bool) {
 	p, ok := r.modelIndex[model]
 	return p, ok
+}
+
+// ProvidersByTier 按成本分级返回渠道列表（配置顺序即优先顺序；未配置该分级返回 nil）。
+func (r *Registry) ProvidersByTier(tier string) []string {
+	return r.tierIndex[tier]
+}
+
+// DefaultModelForProvider 返回 provider 配置序的首个模型（auto 路由选定渠道后确定具体模型）。
+func (r *Registry) DefaultModelForProvider(name string) (string, bool) {
+	ms, ok := r.providerModels[name]
+	if !ok || len(ms) == 0 {
+		return "", false
+	}
+	return ms[0], true
 }

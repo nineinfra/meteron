@@ -92,7 +92,7 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 
 图中方框为实体（应用 / Meteron / LLM Provider / Redis / PostgreSQL / Kafka / ClickHouse），带编号箭头为步骤及流转的数据。箭头方向 = 数据流转方向（起点为读取源，终点为写入目标），步骤执行者标注在箭头标签中：①–④ 由 Meteron 网关同步执行（毫秒级）；⑤–⑨ 由 Meteron 进程内后台 Worker（relay / sink / billing / recon）异步执行，不阻塞请求。Meteron 框以三层错位叠加表示多副本部署：网关无状态、可水平扩容；后台 Worker 经 Redis 分布式锁保证多副本下仅单实例执行。
 
-- **① 请求接入**：应用以 OpenAI 兼容协议调用网关，只改 `base_url` 与鉴权头；网关完成 API-Key 鉴权（HMAC-SHA256 哈希等值查找）、IP/模型白名单与客户/渠道双重限流校验。
+- **① 请求接入**：应用以 OpenAI 兼容协议调用网关，只改 `base_url` 与鉴权头；网关完成 API-Key 鉴权（HMAC-SHA256 哈希等值查找）、IP/模型白名单与客户/渠道双重限流校验，并按三种模式路由（显式 `X-Meteron-Provider` 指定渠道 / `model=auto` 成本分级自动路由 / 常规 route_rules，详见「2.5 渠道路由」）。
 - **② 预算预留**：网关按 `max_tokens` 估算金额，Redis 原子扣减预算缓存（快路径）+ PG 预留表落库复核（可信源）两阶段预留；超额按策略 block/warn/fallback，请求结束按实际用量 confirm（差额归还）或 release。
 - **③ 转发上游**：网关将请求透明转发至 LLM Provider（OpenAI / Anthropic / GLM / 本地模型 / mock）；路由或降级切换模型时同步重写请求体 `model` 字段，保证计费模型与实际执行模型一致。
 - **④ 响应与 usage 嗅探**：网关边透传响应边解析 token 用量——非流式解析 JSON，流式逐帧解析 SSE（自动注入 `stream_options.include_usage`）；计费收尾脱离请求生命周期，客户端断开也不丢账。
@@ -155,16 +155,76 @@ providers:
     base_url: "https://api.openai.com/v1"
     api_key: "sk-..."
     models: ["gpt-4o", "gpt-4o-mini"]
+    cost_tier: premium      # 成本分级：economy | standard | premium（auto 路由按此选渠道）
   - name: zhipu
     type: openai            # GLM 兼容模式同样走 openai 类型
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     api_key: "..."
     models: ["glm-4.6"]
+    cost_tier: standard
   - name: ollama            # 本地部署模型：Ollama / vLLM / LM Studio 等 OpenAI 兼容端点，api_key 可留空
     type: local
     base_url: "http://localhost:11434/v1"
     models: ["llama3.1", "qwen2.5:7b"]
+    cost_tier: economy
 ```
+
+### 2.5 渠道路由：显式指定 / auto 自动 / 成本分级策略
+
+应用接入后每个请求有三种路由模式（按优先级）：
+
+| 模式 | 用法 | 行为 |
+|---|---|---|
+| **显式指定渠道** | 请求头 `X-Meteron-Provider: zhipu` | 锁定该渠道（跳过路由规则）；`model` 具体时直接透传，`model=auto` 时取该渠道配置序首个模型 |
+| **auto 自动路由** | 请求体 `"model": "auto"` | Meteron 按请求复杂度评估选择渠道与模型（见下方策略） |
+| **常规路由** | 请求体 `"model": "gpt-4o"` | `route_rules` 任务类型规则优先，未命中时按模型反查渠道 |
+
+**auto 模式的成本分级策略**——复杂度低/要求低的请求走本地或低成本渠道，复杂度高/要求高的请求走高能力渠道：
+
+```bash
+# 简单问答（输入 < 2000 token 估算）→ economy：本地 Ollama / 国内低成本模型
+curl -X POST localhost:9080/v1/chat/completions -H "$AUTH" \
+  -H "X-Meteron-Customer-ID: $CID" -H "X-Meteron-Task-Type: chat" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
+
+# 复杂任务（多模态/工具调用/长输入 ≥ 8000 token）→ premium：GPT-4o / Claude
+curl -X POST localhost:9080/v1/chat/completions -H "$AUTH" \
+  -H "X-Meteron-Customer-ID: $CID" -H "X-Meteron-Task-Type: chat" \
+  -d '{"model":"auto","tools":[...],"messages":[{"role":"user","content":"分析这张图"}]}'
+
+# 显式质量要求（覆盖启发式）：低要求强制 economy，高要求强制 premium
+curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
+```
+
+复杂度评估信号（优先级从高到低）：
+
+1. **`X-Meteron-Quality` 头**：`low` / `medium` / `high` → `economy` / `standard` / `premium`（显式指定，覆盖启发式）
+2. **多模态或工具调用**（消息含 `image_url`、请求带非空 `tools`）→ `premium`
+3. **输入规模**（token 估算）：`≥ 8000` → `premium`，`≥ 2000` → `standard`，否则 `economy`
+
+成本策略的精细控制通过 `route_rules.policy_config` 的 `auto` 字段（分级阈值与各级目标渠道均可覆盖）：
+
+```json
+{
+  "budget_watermark": 0.2,
+  "auto": {
+    "standard_min_input_tokens": 1000,
+    "premium_min_input_tokens": 4000,
+    "tiers": {
+      "economy":  {"provider": "ollama", "model": "qwen2.5:7b"},
+      "standard": {"provider": "zhipu",  "model": "glm-4.6"},
+      "premium":  {"provider": "openai-main", "model": "gpt-4o"}
+    }
+  }
+}
+```
+
+- 未配置 `tiers` 时按渠道 `cost_tier` 分级反查（配置序优先）
+- 目标分级无可用渠道时向低成本方向降级（premium→standard→economy），可用性优先
+- 预算水位低于 `budget_watermark` 时 auto 结果同样向低成本分级降一级（省钱优先）
+- `economy` 分级同时也是 auto 结果的 fallback（渠道健康降级、预算降级复用现有机制）
+
+> 注意：auto 路由出的最终模型仍受密钥模型白名单校验——使用 auto 模式的密钥需在白名单中放行所有允许路由到的模型。
 
 ### 3. 完成计费供给（每个计费客户一次）
 
@@ -242,6 +302,4 @@ go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / 
                  #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
 ```
 
-模块结构：`internal/gateway`（在线代理）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ingest`（事件与 outbox 投递）、`internal/health`（渠道健康）、`internal/ratelimit`（双重限流）、`internal/ui`（Web 控制台）。
-
-详细评审报告见 [docs/code-review.md](docs/code-review.md)。
+模块结构：`internal/gateway`（在线代理）、`internal/router`（路由策略）、`internal/ledger`（预算与账本）、`internal/pricing`（计价引擎）、`internal/meter`（计量聚合）、`internal/billing`（出账）、`internal/recon`（对账）、`internal/ingest`（事件与 outbox 投递）、`internal/health`（渠道健康）、`internal/ratelimit`（双重限流）、`internal/ui`（Web 控制台）。

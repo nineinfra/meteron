@@ -118,6 +118,13 @@ curl -sS -N -X POST "${BASE}/v1/chat/completions" \
   -d '{"model":"mock-chat","messages":[{"role":"user","content":"流式测试"}],"stream":true}' \
   | grep -c '^data:' | xargs -I{} echo "（SSE 完成，共 {} 个 chunk）"
 
+echo "== 2c. Gateway auto 路由（model=auto：短输入 → economy 渠道 mock-chat）=="
+curl -sS -X POST "${BASE}/v1/chat/completions" \
+  -H "$AUTH" -H "Content-Type: application/json" \
+  -H "X-Meteron-Customer-ID: ${CUSTOMER}" -H "X-Meteron-Task-Type: chat" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"auto 路由测试"}]}'
+echo
+
 echo "== 3. 等待异步链路（Kafka→Sink→ClickHouse）=="
 sleep 5
 
