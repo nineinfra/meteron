@@ -323,10 +323,36 @@ kubectl -n meteron rollout restart statefulset postgres
 ## 开发
 
 ```bash
-go build ./...   # 构建
-go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递
-                 #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
+go build ./...    # 构建
+go test ./internal/...   # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递
+                         #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
 ```
+
+### 集成测试与端到端测试
+
+需要真实基础设施（与 verify.sh 相同的栈）：
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d    # 仅启动中间件（postgres/clickhouse/redis/kafka）
+
+# 集成测试（42 个）：handler 级装配，覆盖网关全链路、供给链、预算两阶段、
+# 阶梯计价、auto 路由、限流、幂等、密钥管控、审计过滤、出账幂等等
+go test ./tests/integration/ -v
+
+# 端到端测试（8 个）：启动完整进程（网关 + 管理 API + 全部后台 Worker + 真实 TCP 端口），
+# 覆盖 verify.sh 等价的完整用户旅程、SSE 计量、并发预算无超卖、真实 ScheduledWorker 过期释放、
+# 渠道健康探测等
+go test ./tests/e2e/ -v
+
+# 自定义 DSN（两个套件共用同一旗标约定）
+go test ./tests/e2e/ -v -args \
+  -pg "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable" \
+  -ch "clickhouse://meteron:meteron123@localhost:9000/meteron" \
+  -redis "localhost:6379" -kafka "localhost:9092" -topic "meteron.meter-events"
+```
+
+> 测试使用独立随机资源（external_id 隔离），可重复执行；会真实写入 PG/ClickHouse/Kafka，
+> 不要指向生产数据源。
 
 模块结构：
 
@@ -359,4 +385,3 @@ meteron/
 Meteron is licensed under Apache 2.0 License.
 
 See [LICENSE](./LICENSE) for full license text.
-
