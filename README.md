@@ -17,7 +17,7 @@ Meteron 是 **AI Token 计量计费网关**。面向大模型服务场景，统�
 | **审计与调试** | 请求全量审计日志多维查询（ClickHouse）；管理后台内置在线调试沙盒直发模型调用 |
 | **数据自持** | 全栈自托管（PG / ClickHouse / Redis / Kafka），多租户 + RBAC 隔离 |
 
-## 快速开始（2 条命令）
+## 快速开始
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --build   # 启动全栈 + Meteron（内置 mock provider，无需任何 API Key）
@@ -102,7 +102,7 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 - **⑧ 出账**：Meteron 进程内 billing Worker 执行 BillingRun，从 ClickHouse 读取明细按费率快照计价（跨档按累计 token 切分），生成 draft 账单 + 账单项 + 不可变账本流水写入 PG；finalize 后账单不可变，跑批幂等可安全重跑。
 - **⑨ 对账**：Meteron 进程内 recon Worker 每小时轻量对账（明细 vs 预聚合）、每日深度对账（ClickHouse 重算金额 vs PG 账本流水合计），差异自动生成 correction 流水写回 PG——多记红冲、少记补差，账本只增不改。
 
-## 生产级使用步骤
+## 生产环境部署步骤
 
 按顺序执行即可从验证环境升级为生产环境。
 
@@ -196,7 +196,7 @@ curl -X POST localhost:9080/v1/chat/completions -H "$AUTH" \
 curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
 ```
 
-复杂度评估信号（优先级从高到低）：
+复杂度评估（优先级从高到低）：
 
 1. **`X-Meteron-Quality` 头**：`low` / `medium` / `high` → `economy` / `standard` / `premium`（显式指定，覆盖启发式）
 2. **多模态或工具调用**（消息含 `image_url`、请求带非空 `tools`）→ `premium`
@@ -226,9 +226,7 @@ curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
 
 > 注意：auto 路由出的最终模型仍受密钥模型白名单校验——使用 auto 模式的密钥需在白名单中放行所有允许路由到的模型。
 
-### 3. 完成计费供给（每个计费客户一次）
-
-7 个 API 依次调用，完整参数见 `scripts/verify.sh` 第 1 段（可直接复制改值）：
+### 3. 完成计费流程
 
 ```
 客户 → 计量指标(billable-metrics) → 产品(products) → 费率卡(rate-cards)
