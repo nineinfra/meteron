@@ -1,13 +1,13 @@
 # Meteron
 
-Meteron 是开源 **AI Token 计量计费网关**。面向大模型服务场景，统一统计 LLM 请求输入/输出 Token，完成费用核算、调用限流、用量审计，支持对接多厂商大模型接口，可作为 OpenAI‑兼容网关计费层，适配私有部署、企业内部大模型平台、多租户 AI 应用。
+Meteron 是 **AI Token 计量计费网关**。面向大模型服务场景，统一统计 LLM 请求输入/输出 Token，完成费用核算、调用限流、用量审计，支持对接多厂商大模型接口，可作为 OpenAI‑兼容网关计费层，适配私有部署、企业内部大模型平台、多租户 AI 应用。
 
 ## 核心价值
 
 | 能力 | 说明 |
 |------|------|
 | **一行接入** | OpenAI 兼容协议透明转发，应用只改 `base_url` 和鉴权头，无 SDK 依赖 |
-| **实时预算管控** | 请求前预留、响应后确认的两阶段预算；超支可阻断/告警/自动降级廉价模型，绝不超卖 |
+| **实时预算管控** | 请求前预留、响应后确认的两阶段预算；超支可阻断/告警/自动降级廉价模型，不超卖 |
 | **精确计费** | 计量事件内嵌费率快照，费率改价不影响历史账单；支持阶梯计价与缓存 token 差异化定价 |
 | **账实一致** | 计量明细（ClickHouse）与账本流水（PostgreSQL）双轨自动对账，差异自动生成红冲/补差流水 |
 | **Web 控制台** | 内嵌可视化看板：token 用量趋势、模型用量明细、预算池余额、账单管理，零前端依赖 |
@@ -17,7 +17,7 @@ Meteron 是开源 **AI Token 计量计费网关**。面向大模型服务场景�
 | **审计与调试** | 请求全量审计日志多维查询（ClickHouse）；管理后台内置在线调试沙盒直发模型调用 |
 | **数据自持** | 全栈自托管（PG / ClickHouse / Redis / Kafka），多租户 + RBAC 隔离 |
 
-## 快速开始（2 条命令）
+## 快速开始
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d --build   # 启动全栈 + Meteron（内置 mock provider，无需任何 API Key）
@@ -47,9 +47,9 @@ API 与 Web 界面使用**独立端点**（便于分别暴露：控制台只对�
 
 控制台为内嵌静态资源（同源调用 Management API，无外部 CDN 依赖），监控数据每 60 秒自动刷新。
 
-## 30 秒手工体验
+## 手工体验
 
-自动验证之外，核心闭环手工只需三步（`KEY` 为引导 API Key）：
+自动验证之外，手工体验只需三步（`KEY` 为引导 API Key）：
 
 ```bash
 # 1. 建客户（拿到 customer_id）
@@ -102,11 +102,11 @@ curl -s "localhost:9080/api/v1/usage?customer_id=<第1步返回的id>" \
 - **⑧ 出账**：Meteron 进程内 billing Worker 执行 BillingRun，从 ClickHouse 读取明细按费率快照计价（跨档按累计 token 切分），生成 draft 账单 + 账单项 + 不可变账本流水写入 PG；finalize 后账单不可变，跑批幂等可安全重跑。
 - **⑨ 对账**：Meteron 进程内 recon Worker 每小时轻量对账（明细 vs 预聚合）、每日深度对账（ClickHouse 重算金额 vs PG 账本流水合计），差异自动生成 correction 流水写回 PG——多记红冲、少记补差，账本只增不改。
 
-## 生产级使用步骤
+## 生产环境部署步骤
 
 按顺序执行即可从验证环境升级为生产环境。
 
-### 1. 密钥加固（必做）
+### 1. 密钥加固
 
 ```bash
 # 生成 32 字节主密钥（API Key 哈希的 HMAC pepper）
@@ -144,7 +144,7 @@ curl -sX DELETE localhost:9080/api/v1/api-keys/<ID> -H "$AUTH"
 密钥级管控在网关链路强制执行：IP 白名单 fail-closed、模型白名单校验最终转发模型
 （含 fallback 调整后）、过期/禁用即时失效。
 
-### 2. 接入真实 Provider
+### 2. 接入 Provider
 
 `config.yaml` 配置后重启（Provider 的 `api_key` 仅存在于配置/环境变量中，不落库）：
 
@@ -196,7 +196,7 @@ curl -X POST localhost:9080/v1/chat/completions -H "$AUTH" \
 curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
 ```
 
-复杂度评估信号（优先级从高到低）：
+复杂度评估（优先级从高到低）：
 
 1. **`X-Meteron-Quality` 头**：`low` / `medium` / `high` → `economy` / `standard` / `premium`（显式指定，覆盖启发式）
 2. **多模态或工具调用**（消息含 `image_url`、请求带非空 `tools`）→ `premium`
@@ -226,9 +226,7 @@ curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
 
 > 注意：auto 路由出的最终模型仍受密钥模型白名单校验——使用 auto 模式的密钥需在白名单中放行所有允许路由到的模型。
 
-### 3. 完成计费供给（每个计费客户一次）
-
-7 个 API 依次调用，完整参数见 `scripts/verify.sh` 第 1 段（可直接复制改值）：
+### 3. 完成计费流程
 
 ```
 客户 → 计量指标(billable-metrics) → 产品(products) → 费率卡(rate-cards)
@@ -239,7 +237,7 @@ curl ... -H "X-Meteron-Quality: low"  -d '{"model":"auto",...}'
 - **预算池**决定管控：`exhaust_policy` = `block`（超支拒绝）/ `warn`（告警放行）/ `fallback`（自动降级）
 - 后续改价只需新增费率卡规则——历史计量事件内嵌快照，改价不影响历史账单
 
-### 4. 验证计费闭环
+### 4. 验证计费
 
 ```bash
 # 发起一次真实对话，然后：
@@ -325,10 +323,36 @@ kubectl -n meteron rollout restart statefulset postgres
 ## 开发
 
 ```bash
-go build ./...   # 构建
-go test ./...    # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递
-                 #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
+go build ./...    # 构建
+go test ./internal/...   # 单元测试（计价引擎 / 预算状态机 / SSE 嗅探 / offset 提交语义 / outbox 投递
+                         #   / API Key 哈希与白名单 / 双重限流滑动窗口 / 渠道健康降级 / 审计查询构造 / 调试沙盒）
 ```
+
+### 集成测试与端到端测试
+
+需要真实基础设施（与 verify.sh 相同的栈）：
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d    # 仅启动中间件（postgres/clickhouse/redis/kafka）
+
+# 集成测试（42 个）：handler 级装配，覆盖网关全链路、供给链、预算两阶段、
+# 阶梯计价、auto 路由、限流、幂等、密钥管控、审计过滤、出账幂等等
+go test ./tests/integration/ -v
+
+# 端到端测试（8 个）：启动完整进程（网关 + 管理 API + 全部后台 Worker + 真实 TCP 端口），
+# 覆盖 verify.sh 等价的完整用户旅程、SSE 计量、并发预算无超卖、真实 ScheduledWorker 过期释放、
+# 渠道健康探测等
+go test ./tests/e2e/ -v
+
+# 自定义 DSN（两个套件共用同一旗标约定）
+go test ./tests/e2e/ -v -args \
+  -pg "host=localhost port=5432 user=meteron password=meteron123 dbname=meteron sslmode=disable" \
+  -ch "clickhouse://meteron:meteron123@localhost:9000/meteron" \
+  -redis "localhost:6379" -kafka "localhost:9092" -topic "meteron.meter-events"
+```
+
+> 测试使用独立随机资源（external_id 隔离），可重复执行；会真实写入 PG/ClickHouse/Kafka，
+> 不要指向生产数据源。
 
 模块结构：
 
@@ -361,4 +385,3 @@ meteron/
 Meteron is licensed under Apache 2.0 License.
 
 See [LICENSE](./LICENSE) for full license text.
-
