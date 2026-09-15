@@ -53,12 +53,23 @@ end
 return 0
 `
 
+// refreshLua 续期分布式锁（比较 token 后重设 TTL）。
+// 长跑批（如全租户出账）耗时可能超过初始 TTL：无续期则锁提前过期，
+// 另一个实例可同时进入跑批，产生重复 draft 账单。
+const refreshLua = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+`
+
 // Redis 封装预算缓存与分布式锁。
 type Redis struct {
 	Client        *redis.Client
 	reserveScript *redis.Script
 	addbackScript *redis.Script
 	releaseScript *redis.Script
+	refreshScript *redis.Script
 }
 
 func NewRedis(ctx context.Context, addr string) (*Redis, error) {
@@ -73,6 +84,7 @@ func NewRedis(ctx context.Context, addr string) (*Redis, error) {
 		reserveScript: redis.NewScript(reserveLua),
 		addbackScript: redis.NewScript(addbackLua),
 		releaseScript: redis.NewScript(releaseLua),
+		refreshScript: redis.NewScript(refreshLua),
 	}, nil
 }
 
@@ -138,6 +150,16 @@ func (r *Redis) DistLock(ctx context.Context, key string, ttl time.Duration) (to
 	token = hex.EncodeToString(b)
 	ok, err = r.Client.SetNX(ctx, key, token, ttl).Result()
 	return token, ok, err
+}
+
+// RefreshLock 续期分布式锁（仅持有者 token 匹配才延长 TTL）。
+// 返回是否续期成功（false = 锁已丢失/已过期，持有者应停止工作）。
+func (r *Redis) RefreshLock(ctx context.Context, key, token string, ttl time.Duration) (bool, error) {
+	v, err := r.refreshScript.Run(ctx, r.Client, []string{key}, token, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return v == 1, nil
 }
 
 // Unlock 释放分布式锁（仅持有者 token 匹配才删除）。

@@ -1,0 +1,15 @@
+# Docker 构建上下文忽略列表。
+#
+# 必须位于仓库根目录：deploy/Dockerfile 使用 `COPY . ./`，构建上下文即仓库根，
+# 此前放在 deploy/Dockerfile.dockerignore 不生效（Docker 只读取上下文根的 .dockerignore）。
+.git
+.gitignore
+.github
+*.md
+scripts/
+config.yaml
+web/node_modules
+internal/ui/dist
+deploy/data
+debug.log
+.workbuddy

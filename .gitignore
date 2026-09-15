@@ -16,6 +16,9 @@ web/node_modules/
 debug.log
 *.lnk
 
+# WorkBuddy 项目数据（会话与记忆，非源码）
+.workbuddy/
+
 # 本地 Go 工具链（便携版，CI/容器构建不依赖）
 .gotoolchain/
 

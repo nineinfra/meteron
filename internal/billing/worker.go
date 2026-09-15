@@ -43,7 +43,16 @@ func NewWorker(db *pgxpool.Pool, ch driver.Conn, rds *store.Redis, cfg *config.C
 	return &Worker{db: db, ch: ch, rds: rds, cfg: cfg, log: log}
 }
 
-const billingLock = "meteron:lock:billing"
+const (
+	billingLock = "meteron:lock:billing"
+	// billingLockTTL 锁 TTL；billingLockRenew 为续期间隔（远小于 TTL，容忍多次续期失败）。
+	// 无续期时，跑批耗时超过 TTL 会让锁提前过期，另一实例可并发进入 →
+	// 同一周期产生重复 draft 账单（PG 侧已加部分唯一索引兜底，见 006 迁移）。
+	billingLockTTL   = 30 * time.Minute
+	billingLockRenew = billingLockTTL / 5
+	// billingEventWindow 明细拉取窗口：整周期一次性载入会在大客户（百万级事件）上打爆内存。
+	billingEventWindow = time.Hour
+)
 
 // RunDailyLoop 自动调度：每个 BillingInterval 为全部租户跑批上一自然日（UTC）。
 // BillingInterval=0 表示仅手动触发（默认）。
@@ -67,11 +76,16 @@ func (w *Worker) RunDailyLoop(ctx context.Context) error {
 
 // RunAllTenantsYesterday 为全部租户跑批上一自然日。
 func (w *Worker) RunAllTenantsYesterday(ctx context.Context) {
-	token, ok, err := w.rds.DistLock(ctx, billingLock, 30*time.Minute)
+	token, ok, err := w.rds.DistLock(ctx, billingLock, billingLockTTL)
 	if err != nil || !ok {
 		return
 	}
 	defer w.rds.Unlock(context.WithoutCancel(ctx), billingLock, token)
+
+	// 锁续期：全租户跑批可能远超 30min，锁过期会让另一实例并发跑批。
+	renewCtx, stopRenew := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopRenew()
+	go w.renewLock(renewCtx, billingLock, token)
 
 	now := time.Now().UTC()
 	dayStart := now.AddDate(0, 0, -1).Truncate(24 * time.Hour)
@@ -83,6 +97,30 @@ func (w *Worker) RunAllTenantsYesterday(ctx context.Context) {
 	for _, tenantID := range tenants {
 		if _, err := w.RunBilling(ctx, tenantID, dayStart, dayStart.Add(24*time.Hour)); err != nil {
 			w.log.Error("billing run failed", "tenant", tenantID, "period_start", dayStart, "err", err)
+		}
+	}
+}
+
+// renewLock 周期性续期跑批锁；续期失败（锁已被其他实例接管）时告警并停止。
+// 仅告警不中断本轮跑批：draft 重建是幂等的，中断反而留下半成品状态；
+// 真正的一致性由 bills 表的部分唯一索引与 draft 重建逻辑保证。
+func (w *Worker) renewLock(ctx context.Context, key, token string) {
+	t := time.NewTicker(billingLockRenew)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			ok, err := w.rds.RefreshLock(ctx, key, token, billingLockTTL)
+			if err != nil {
+				w.log.Error("billing: refresh lock failed", "err", err)
+				continue
+			}
+			if !ok {
+				w.log.Error("billing: lock lost during run (another instance took over?)")
+				return
+			}
 		}
 	}
 }
@@ -191,15 +229,8 @@ ORDER BY start_time DESC LIMIT 1`,
 	}
 	contractID, _ := uuid.Parse(contractIDStr)
 
-	events, err := meter.QueryEvents(ctx, w.ch, tenantID, customerID, periodStart, periodEnd)
-	if err != nil {
-		return fmt.Errorf("query events: %w", err)
-	}
-	if len(events) == 0 {
-		return nil
-	}
-
-	// 定稿账单保护：该周期已 finalized → 跳过（V1 走 amending；MVP 仅告警）
+	// 定稿账单保护：该周期已 finalized → 跳过（V1 走 amending；MVP 仅告警）。
+	// 提前于明细拉取：避免为已定稿周期拉取全量事件（无谓的重查询）。
 	var finalizedID *string
 	if err := w.db.QueryRow(ctx, `
 SELECT id::text FROM bills
@@ -207,8 +238,8 @@ WHERE tenant_id=$1::uuid AND customer_id=$2::uuid
   AND period_start=$3 AND period_end=$4 AND status IN ('finalized','amending')
 LIMIT 1`,
 		tenantID.String(), customerID.String(), periodStart, periodEnd).Scan(&finalizedID); err == nil && finalizedID != nil {
-		w.log.Warn("late events for finalized period (amending is V1, skipped in MVP)",
-			"customer", customerID, "period", periodStart, "events", len(events), "bill_id", *finalizedID)
+		w.log.Warn("billing skipped: period already finalized (amending is V1, skipped in MVP)",
+			"customer", customerID, "period", periodStart, "bill_id", *finalizedID)
 		result.SkippedFinal++
 		return nil
 	} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -262,32 +293,51 @@ LIMIT 1`,
 	var entries []entryPlan
 
 	var currency = "USD"
-	for _, ev := range events {
-		snap, perr := pricing.ParseSnapshot([]byte(ev.Snapshot))
-		if perr != nil || snap == nil || snap.ProductID == uuid.Nil {
-			result.addError(fmt.Sprintf("event %s: missing/invalid pricing snapshot", ev.EventID))
-			continue
-		}
-		cost, newCum := pricing.EventCostCumulative(snap, cumByProduct[snap.ProductID],
-			ev.InputTokens, ev.OutputTokens, ev.CachedTokens)
-		cumByProduct[snap.ProductID] = newCum
-		if snap.Currency != "" {
-			currency = snap.Currency
-		}
-		entries = append(entries, entryPlan{eventID: ev.EventID, cost: cost, memo: fmt.Sprintf("%s/%s", ev.Provider, ev.Model)})
+	var totalEvents int
 
-		la, ok := lines[snap.ProductID]
-		if !ok {
-			la = &lineAgg{
-				productID: snap.ProductID, snapshot: snap,
-				taskTypes: map[string]struct{}{}, models: map[string]struct{}{},
-			}
-			lines[snap.ProductID] = la
+	// 按时间窗口分片拉取明细：整周期一次性载入会在大客户（单周期百万级事件）上打爆内存。
+	// tiered 计价依赖事件时间顺序，故按窗口升序分片，累计状态（cumByProduct）跨片保持。
+	for win := periodStart; win.Before(periodEnd); {
+		winEnd := win.Add(billingEventWindow)
+		if winEnd.After(periodEnd) {
+			winEnd = periodEnd
 		}
-		la.amount = la.amount.Add(cost)
-		la.tokens += ev.InputTokens + ev.OutputTokens
-		la.taskTypes[ev.TaskType] = struct{}{}
-		la.models[ev.Model] = struct{}{}
+		events, err := meter.QueryEvents(ctx, w.ch, tenantID, customerID, win, winEnd)
+		if err != nil {
+			return fmt.Errorf("query events [%s,%s): %w", win.Format(time.RFC3339), winEnd.Format(time.RFC3339), err)
+		}
+		for _, ev := range events {
+			totalEvents++
+			snap, perr := pricing.ParseSnapshot([]byte(ev.Snapshot))
+			if perr != nil || snap == nil || snap.ProductID == uuid.Nil {
+				result.addError(fmt.Sprintf("event %s: missing/invalid pricing snapshot", ev.EventID))
+				continue
+			}
+			cost, newCum := pricing.EventCostCumulative(snap, cumByProduct[snap.ProductID],
+				ev.InputTokens, ev.OutputTokens, ev.CachedTokens)
+			cumByProduct[snap.ProductID] = newCum
+			if snap.Currency != "" {
+				currency = snap.Currency
+			}
+			entries = append(entries, entryPlan{eventID: ev.EventID, cost: cost, memo: fmt.Sprintf("%s/%s", ev.Provider, ev.Model)})
+
+			la, ok := lines[snap.ProductID]
+			if !ok {
+				la = &lineAgg{
+					productID: snap.ProductID, snapshot: snap,
+					taskTypes: map[string]struct{}{}, models: map[string]struct{}{},
+				}
+				lines[snap.ProductID] = la
+			}
+			la.amount = la.amount.Add(cost)
+			la.tokens += ev.InputTokens + ev.OutputTokens
+			la.taskTypes[ev.TaskType] = struct{}{}
+			la.models[ev.Model] = struct{}{}
+		}
+		win = winEnd
+	}
+	if totalEvents == 0 {
+		return nil // 周期内无用量事件
 	}
 	if len(lines) == 0 {
 		return nil // 全部事件无有效快照，不生成空账单

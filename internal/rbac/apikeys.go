@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,10 +49,61 @@ func (i *Identity) HasScope(s string) bool {
 	return false
 }
 
+// 鉴权缓存参数。
+//
+// Authenticate 位于网关热路径：每次 LLM 调用都要查一次 PG，连接池（默认 20）
+// 会被鉴权查询占满，进而阻塞出账/预留等写路径。
+// TTL 取 5s 是吞吐与安全性的显式权衡：禁用/删除密钥的生效延迟最多 5s，
+// 且任何密钥写操作（创建/启用禁用/删除）都会整体清空缓存，
+// 保证本实例内"变更即时生效"；多副本部署时其他实例最多有 5s 陈旧窗口。
+const (
+	authCacheTTL = 5 * time.Second
+	authCacheMax = 10_000
+)
+
+type authCacheEntry struct {
+	ident *Identity
+	exp   time.Time
+}
+
 type Service struct {
 	db        *pgxpool.Pool
 	hmacKey   []byte
 	legacyGCM cipher.AEAD // 仅用于 Bootstrap 升级 v1 确定性加密的存量 key_hash
+
+	cacheMu sync.RWMutex
+	cache   map[string]authCacheEntry // key_hash → 身份（仅缓存成功鉴权结果）
+}
+
+// cacheGet 命中未过期缓存则返回身份副本（副本：避免调用方修改共享状态）。
+func (s *Service) cacheGet(hash string) *Identity {
+	s.cacheMu.RLock()
+	e, ok := s.cache[hash]
+	s.cacheMu.RUnlock()
+	if !ok || time.Now().After(e.exp) {
+		return nil
+	}
+	cp := *e.ident
+	return &cp
+}
+
+func (s *Service) cacheSet(hash string, ident *Identity) {
+	cp := *ident
+	s.cacheMu.Lock()
+	if len(s.cache) >= authCacheMax {
+		// 达上限直接重建：避免缓存无界增长（海量无效/低频 key 场景）
+		s.cache = make(map[string]authCacheEntry, 1024)
+	}
+	s.cache[hash] = authCacheEntry{ident: &cp, exp: time.Now().Add(authCacheTTL)}
+	s.cacheMu.Unlock()
+}
+
+// invalidate 清空鉴权缓存。密钥状态或哈希变更后必须调用，
+// 否则被禁用/删除的密钥在 TTL 内仍可通过鉴权。
+func (s *Service) invalidate() {
+	s.cacheMu.Lock()
+	s.cache = make(map[string]authCacheEntry, 1024)
+	s.cacheMu.Unlock()
 }
 
 func NewService(db *pgxpool.Pool, aesKeyHex string) (*Service, error) {
@@ -190,6 +242,7 @@ WHERE id=$2::uuid AND tenant_id=$3::uuid AND deleted_at IS NULL`, enabled, keyID
 	if tag.RowsAffected() == 0 {
 		return ErrKeyNotFound
 	}
+	s.invalidate() // 禁用必须立即生效，不能等缓存 TTL
 	return nil
 }
 
@@ -204,6 +257,7 @@ WHERE id=$1::uuid AND tenant_id=$2::uuid AND deleted_at IS NULL`, keyID.String()
 	if tag.RowsAffected() == 0 {
 		return ErrKeyNotFound
 	}
+	s.invalidate() // 删除必须立即生效，不能等缓存 TTL
 	return nil
 }
 
@@ -234,6 +288,7 @@ func (s *Service) Bootstrap(ctx context.Context, bootstrapKey string) (tenantID 
 			`UPDATE api_keys SET key_hash=$1, updated_at=NOW() WHERE key_hash=$2`, hash, legacy); err != nil {
 			return tenantID, false, err
 		}
+		s.invalidate()
 		// 确保引导密钥可用（幂等）
 		var cnt int
 		if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM api_keys WHERE key_hash=$1`, hash).Scan(&cnt); err != nil {
@@ -281,6 +336,9 @@ VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)`,
 // 已禁用/已删除/已过期的密钥一律返回错误（SQL 条件过滤，过期自动失效）。
 func (s *Service) Authenticate(ctx context.Context, plaintext string) (*Identity, error) {
 	hash := hashKey(s.hmacKey, plaintext)
+	if ident := s.cacheGet(hash); ident != nil {
+		return ident, nil
+	}
 	var (
 		idStr, tenantStr string
 		customerStr      *string

@@ -28,38 +28,49 @@ type Limiter interface {
 
 // ---- Redis 实现 ----
 
-// rateLimitLua 滑动窗口（ZSET 存时间戳，HASH 存每条 cost）：
-// KEYS[1]=zset, KEYS[2]=hash；ARGV[1]=now_ms, ARGV[2]=window_ms,
-// ARGV[3]=limit, ARGV[4]=cost, ARGV[5]=唯一 member id。
-// 过期条目由 ZREMRANGEBYSCORE 清除（HASH 字段随 key TTL 整体过期，无独立泄漏）。
+// slidingWindowSuffix 滑动窗口 v2 的 key 后缀。
+// v2 使用独立 key：v1 的 ":z"/":h" 数据在窗口 TTL 后自然过期，无需手工清理。
+const slidingWindowSuffix = ":sw"
+
+// rateLimitLua 滑动窗口（单 ZSET 承载全部状态：member = "cost:唯一id"，score = 时间戳 ms）。
+// KEYS[1]=zset；ARGV[1]=now_ms, ARGV[2]=window_ms, ARGV[3]=limit, ARGV[4]=cost, ARGV[5]=唯一 id。
+//
+// v1 为 ZSET+HASH 且逐条 HGET 求和：窗口内 N 个请求就是 N 次 redis.call，
+// 高 RPM 下单次限流检查要执行数千次调用，直接阻塞 Redis 单线程（Lua 原子执行期间）。
+// v2 把 cost 编码进 member，一次 ZRANGE 后在 Lua 内求和，
+// Redis 调用数恒为 4（与窗口内请求数无关），且不再需要 HASH（少一个 key 与一次 TTL 维护）。
 const rateLimitLua = `
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
-local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+local min = tonumber(ARGV[1]) - tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', min)
 local total = 0
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for _, m in ipairs(members) do
-    total = total + tonumber(redis.call('HGET', KEYS[2], m) or '0')
+    local sep = string.find(m, ':', 1, true)
+    if sep then
+        total = total + (tonumber(string.sub(m, 1, sep - 1)) or 0)
+    end
 end
 if total + tonumber(ARGV[4]) > tonumber(ARGV[3]) then
     return 0
 end
-redis.call('ZADD', KEYS[1], ARGV[1], ARGV[5])
-redis.call('HSET', KEYS[2], ARGV[5], ARGV[4])
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4] .. ':' .. ARGV[5])
 redis.call('PEXPIRE', KEYS[1], ARGV[2])
-redis.call('PEXPIRE', KEYS[2], ARGV[2])
 return 1
 `
 
-// acquireLua 并发信号量获取：超限拒绝；首个许可设置兜底 TTL。
+// acquireLua 并发信号量获取：超限拒绝；每次获取都刷新兜底 TTL。
 // KEYS[1]=counter；ARGV[1]=limit, ARGV[2]=ttl_ms。
+//
+// TTL 必须在每次获取时刷新（v1 仅在首个许可 v==1 时设置）：
+// 计数器长期不为零时 TTL 到期会直接删除 key，下一次获取从 0 重新开始计数，
+// 而此前的许可仍被持有 —— 并发上限被静默突破。
 const acquireLua = `
 local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
 if cur + 1 > tonumber(ARGV[1]) then
     return 0
 end
-local v = redis.call('INCR', KEYS[1])
-if v == 1 then
-    redis.call('PEXPIRE', KEYS[1], ARGV[2])
-end
+redis.call('INCR', KEYS[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
 return 1
 `
 
@@ -75,10 +86,12 @@ return v
 
 // RedisLimiter Redis 实现的限流器。
 type RedisLimiter struct {
-	rdb          *redis.Client
-	rateScript   *redis.Script
+	rdb           *redis.Client
+	rateScript    *redis.Script
 	acquireScript *redis.Script
 	releaseScript *redis.Script
+	// nowFunc 可注入时钟：限流窗口以客户端时间判定，测试需可控时间。
+	nowFunc func() time.Time
 }
 
 func NewRedisLimiter(rdb *redis.Client) *RedisLimiter {
@@ -87,6 +100,7 @@ func NewRedisLimiter(rdb *redis.Client) *RedisLimiter {
 		rateScript:    redis.NewScript(rateLimitLua),
 		acquireScript: redis.NewScript(acquireLua),
 		releaseScript: redis.NewScript(releaseLua),
+		nowFunc:       time.Now,
 	}
 }
 
@@ -94,9 +108,9 @@ func (l *RedisLimiter) AllowRate(ctx context.Context, key string, limit int64, c
 	if limit <= 0 {
 		return true, nil // 不限流
 	}
-	nowMS := time.Now().UnixMilli()
+	nowMS := l.nowFunc().UnixMilli()
 	res, err := l.rateScript.Run(ctx, l.rdb,
-		[]string{key + ":z", key + ":h"},
+		[]string{key + slidingWindowSuffix},
 		nowMS, window.Milliseconds(), limit, cost, uuid.NewString()).Int64()
 	if err != nil {
 		return false, err
@@ -104,13 +118,16 @@ func (l *RedisLimiter) AllowRate(ctx context.Context, key string, limit int64, c
 	return res == 1, nil
 }
 
+// staleTTL 并发许可的兜底 TTL：
+// 长流式响应（本地模型可达数分钟）期间许可必须保持持有；TTL 仅在进程崩溃
+// 无法 release 时兜底回收，取 10 分钟足够覆盖极端推理时长。
+// 持有期间由 keepAlive 周期续期，正常路径不会因 TTL 到期而丢失许可。
+const staleTTL = 10 * time.Minute
+
 func (l *RedisLimiter) Acquire(ctx context.Context, key string, limit int64) (release func(), ok bool, err error) {
 	if limit <= 0 {
 		return func() {}, true, nil // 不限流
 	}
-	// 兜底 TTL：长流式响应（本地模型可达数分钟）期间许可必须保持持有；
-	// TTL 仅在进程崩溃无法 release 时兜底回收，取 10 分钟足够覆盖极端推理时长。
-	const staleTTL = 10 * time.Minute
 	res, err := l.acquireScript.Run(ctx, l.rdb, []string{key}, limit, staleTTL.Milliseconds()).Int64()
 	if err != nil {
 		return nil, false, err
@@ -118,13 +135,40 @@ func (l *RedisLimiter) Acquire(ctx context.Context, key string, limit int64) (re
 	if res != 1 {
 		return nil, false, nil
 	}
+
+	// 持有期间持续续期：并发打满时可能长时间没有新的 Acquire（无人刷新 TTL），
+	// 而长流式响应又可能超过 staleTTL —— key 过期会让计数归零、并发上限被突破。
+	// 进程崩溃时心跳 goroutine 随之消失，许可仍由 staleTTL 兜底回收。
+	stop := make(chan struct{})
+	var once sync.Once
+	go l.keepAlive(key, stop)
+
+	// release 由 once 保护：重复调用只释放一次。
+	// v1 未做幂等保护，重复 release 会多扣一次计数（把其他持有者的许可也扣掉）。
 	release = func() {
-		if _, err := l.releaseScript.Run(context.Background(), l.rdb, []string{key}).Result(); err != nil {
-			// 释放失败仅记录（许可靠兜底 TTL 回收），不应中断响应路径
-			_ = err
-		}
+		once.Do(func() {
+			close(stop)
+			if _, err := l.releaseScript.Run(context.Background(), l.rdb, []string{key}).Result(); err != nil {
+				// 释放失败仅记录（许可靠兜底 TTL 回收），不应中断响应路径
+				_ = err
+			}
+		})
 	}
 	return release, true, nil
+}
+
+// keepAlive 持有期间周期性续期许可计数 key，直到 stop 关闭。
+func (l *RedisLimiter) keepAlive(key string, stop <-chan struct{}) {
+	t := time.NewTicker(staleTTL / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			_ = l.rdb.Expire(context.Background(), key, staleTTL).Err()
+		}
+	}
 }
 
 // ---- 内存实现（单测替身 / Redis 不可用时的降级选项）----

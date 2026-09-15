@@ -206,14 +206,24 @@ func decodeBodySilent(r *http.Request, v interface{}) bool {
 	return json.Unmarshal(body, v) == nil
 }
 
+// writeErr 统一错误响应。
+//
+// 5xx 属内部故障：错误详情可能包含 SQL、约束名、内部地址等，只记日志不回客户端
+// （依赖 main 中已设置的 slog.Default）。4xx 为调用方可纠正的错误，
+// 保留 detail 便于自助排障。
 func writeErr(w http.ResponseWriter, err error) {
 	biz := common.FromErr(err)
+	detail := err.Error()
+	if biz.HTTPStatus >= http.StatusInternalServerError {
+		slog.Default().Error("api internal error", "code", biz.Code, "msg", biz.Msg, "err", err)
+		detail = "internal error"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(biz.HTTPStatus)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"code": biz.Code,
 		"msg":  biz.Msg,
-		"data": map[string]string{"detail": err.Error()},
+		"data": map[string]string{"detail": detail},
 	})
 }
 

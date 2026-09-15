@@ -177,6 +177,9 @@ WHERE tenant_id = toUUID($1) AND hour = $2`,
 }
 
 // runDeep 深度对账：CH 明细按 snapshot 重算金额 vs Ledger usage_charge+correction 合计。
+// reconEventWindow 明细拉取窗口：整周期一次性载入会在大客户（百万级事件）上打爆内存。
+const reconEventWindow = time.Hour
+
 // 差异（含缺失流水）生成 correction 流水，保持账本不可变。
 func (w *Worker) runDeep(ctx context.Context, tenantID uuid.UUID, from, to time.Time) error {
 	runID, err := w.createRun(ctx, tenantID, from, map[string]string{"type": "deep", "from": from.Format(time.RFC3339), "to": to.Format(time.RFC3339)})
@@ -204,15 +207,9 @@ func (w *Worker) runDeep(ctx context.Context, tenantID uuid.UUID, from, to time.
 			return ctx.Err()
 		default:
 		}
-		events, err := meter.QueryEvents(ctx, w.ch, tenantID, customerID, from, to)
-		if err != nil {
-			return w.failRun(ctx, runID, err)
-		}
-		if len(events) == 0 {
-			continue
-		}
-
 		// 2. 期望金额：按 snapshot 重算（与 BillingRun 同口径：tiered 按产品累计）
+		// 按时间窗口分片拉取明细：整周期一次性载入会在大客户上打爆内存；
+		// tiered 累计状态（cumByProduct）跨片保持，窗口按时间升序推进。
 		type plan struct {
 			eventID uuid.UUID
 			cost    decimal.Decimal
@@ -220,17 +217,28 @@ func (w *Worker) runDeep(ctx context.Context, tenantID uuid.UUID, from, to time.
 		cumByProduct := map[uuid.UUID]uint64{}
 		expect := map[uuid.UUID]decimal.Decimal{}
 		var plans []plan
-		for _, ev := range events {
-			usageTokens = usageTokens.Add(decimal.NewFromInt(int64(ev.InputTokens + ev.OutputTokens)))
-			snap, perr := pricing.ParseSnapshot([]byte(ev.Snapshot))
-			if perr != nil || snap == nil || snap.ProductID == uuid.Nil {
-				continue
+		for win := from; win.Before(to); {
+			winEnd := win.Add(reconEventWindow)
+			if winEnd.After(to) {
+				winEnd = to
 			}
-			cost, newCum := pricing.EventCostCumulative(snap, cumByProduct[snap.ProductID],
-				ev.InputTokens, ev.OutputTokens, ev.CachedTokens)
-			cumByProduct[snap.ProductID] = newCum
-			expect[ev.EventID] = cost
-			plans = append(plans, plan{eventID: ev.EventID, cost: cost})
+			events, err := meter.QueryEvents(ctx, w.ch, tenantID, customerID, win, winEnd)
+			if err != nil {
+				return w.failRun(ctx, runID, err)
+			}
+			for _, ev := range events {
+				usageTokens = usageTokens.Add(decimal.NewFromInt(int64(ev.InputTokens + ev.OutputTokens)))
+				snap, perr := pricing.ParseSnapshot([]byte(ev.Snapshot))
+				if perr != nil || snap == nil || snap.ProductID == uuid.Nil {
+					continue
+				}
+				cost, newCum := pricing.EventCostCumulative(snap, cumByProduct[snap.ProductID],
+					ev.InputTokens, ev.OutputTokens, ev.CachedTokens)
+				cumByProduct[snap.ProductID] = newCum
+				expect[ev.EventID] = cost
+				plans = append(plans, plan{eventID: ev.EventID, cost: cost})
+			}
+			win = winEnd
 		}
 		if len(plans) == 0 {
 			continue

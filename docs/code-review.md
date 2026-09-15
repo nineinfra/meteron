@@ -246,3 +246,29 @@ gateway / api / health 测试用例）。
 | 6 | 幂等键占用不区分预留状态 | released/expired 的同键重试永远 409，与常见幂等语义（成功前可重试）相悖 | 仅 pending/confirmed 视为占用（唯一约束改部分索引） |
 | 7 | `from` 可传 1970 年绕过 24h 默认窗口 | FINAL+跨全分区扫描代价高；audit 排序缺 event_id 次级键，OFFSET 翻页在时间并列处可能重复/漏行 | 校验 from≤to、限制最大跨度；`ORDER BY event_time, event_id` |
 | 8 | mock 渠道探测样本稀释错误率 | BaseURL 为空的渠道每 interval 注入成功样本，真实流量 100% 失败时混合探测可能低于阈值，延迟自动禁用 | 探测样本与真实流量分桶统计 |
+
+### 状态更新（第三轮，2026-09-15）
+
+| # | 状态 | 处理 |
+|---|---|---|
+| 1 | 已修复 | 滑动窗口改为单 ZSET（member 编码 `cost:uuid`），Lua 内求和：Redis 调用数恒为 4，与窗口内请求数无关；不再需要 HASH key。已引入 miniredis 补 Redis 实现语义测试 |
+| 2 | 已修复 | Acquire 每次都刷新 TTL（原仅首个许可设置 → 计数长期不为零时 key 过期、计数清零超发）；新增持有期 keepAlive 心跳（TTL/4 续期），进程崩溃仍由 staleTTL 兜底；release 用 sync.Once 保证幂等 |
+| 3 | 已修复 | gateway 与 api 两处 writeErr：5xx（含 502 上游）detail 只记 slog、对外固定 `internal error`；4xx 保留 detail |
+
+## 9. 第三轮修复：P0/P1 缺陷（2026-09-15）
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| P0 | 预聚合键缺租户/客户维度 → 跨客户用量串账 | `aggregate.go` 聚合键前置 tenantID+customerID（表排序键本就含这两列）；补单元测试 |
+| P0 | MeterWorker 内存无界 | pendingMsg 只留 topic/partition/offset（丢弃 64KB 载荷）；软/硬阈值背压；seenIDs 上限降级 |
+| P0 | Sink 写 CH 失败后 for{} 死循环，消费静默停滞 | 5 次指数退避（3s→30s），超限返回错误停止 Worker；main 中触发进程退出以免静默 |
+| P1 | bills 无周期唯一约束 + 分布式锁不续期 → 重复 draft 账单 | 迁移 `006` 部分唯一索引（draft/finalized）；`Redis.RefreshLock` + 跑批续期 goroutine |
+| P1 | QueryEvents 无上限，出账/深度对账全量载入内存 | 加 100 万行硬上限（超限报错）；出账与对账改为按 1h 窗口分片拉取 |
+| P1 | ClickHouse 无 TTL、明细存 64KB raw_payload | 明细 TTL 13 个月、hourly 3 年 |
+| P1 | Authenticate 每次请求查 PG（热路径） | 5s 进程内缓存（上限 1 万）；密钥写操作整体失效，保证禁用即时生效 |
+| P1 | flushClosed 持锁写 ClickHouse（最长 30s 阻塞消费） | 改为锁内摘桶、锁外写入；inflight 防重复落盘 + hourBucket.merge 处理回写 |
+| — | 工程卫生 | 删除误提交的 debug.log；`deploy/Dockerfile.dockerignore` 移至仓库根 `.dockerignore`（context 为仓库根，原位置不生效） |
+
+**后续待办**：`006` 迁移要求库内无同周期重复 draft，若存在会建索引失败（故意不静默跳过），
+需先手工清理。hourly 表的历史数据仍是串账状态，需用 `meter_events FINAL` 重建
+（修复只对新事件生效）。

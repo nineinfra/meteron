@@ -165,7 +165,10 @@ func main() {
 
 	go func() {
 		if err := sinkWorker.Run(ctx); err != nil {
-			log.Error("sink worker exited", "err", err)
+			// 计量落盘是核心链路：Worker 停止后 Kafka lag 会静默增长且无告警，
+			// 必须让进程退出以触发重启/告警（未提交 offset，重放幂等）。
+			log.Error("sink worker exited, shutting down process", "err", err)
+			stop()
 		}
 	}()
 	go func() {

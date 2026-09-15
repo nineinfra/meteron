@@ -2,6 +2,7 @@ package meter
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -250,22 +251,36 @@ WHERE tenant_id = toUUID($1) AND event_time >= $2 AND event_time < $3`
 	return out, nil
 }
 
+// maxEventRows 单次明细查询返回的最大行数（防 OOM）。
+//
+// 出账与深度对账按客户全量载入内存：大客户单周期可达百万级事件，
+// 无上限时进程 RSS 会被结果集直接打爆。超出上限应缩小查询区间
+// （billing 已按小时窗口分片拉取，见 billing.Worker.billCustomer）。
+const maxEventRows = 1_000_000
+
 // QueryEvents 查询计量明细（FINAL 必带）。
+// 结果最多 maxEventRows 行，超出返回错误（调用方需缩小时间区间分片查询）。
 func QueryEvents(ctx context.Context, ch driver.Conn, tenantID, customerID uuid.UUID, from, to time.Time) ([]*EventRow, error) {
+	// LIMIT maxEventRows+1：多取一行用于识别"超出上限"，避免无界结果集传输
 	rows, err := ch.Query(ctx, `
 SELECT event_id, event_time, task_type, model, provider, agent_id,
        input_tokens, output_tokens, cached_input_tokens,
        pricing_context_snapshot, currency, metadata
 FROM meter_events FINAL
 WHERE tenant_id = toUUID($1) AND customer_id = toUUID($2) AND event_time >= $3 AND event_time < $4
-ORDER BY event_time, event_id`,
-		tenantID.String(), customerID.String(), from, to)
+ORDER BY event_time, event_id
+LIMIT $5`,
+		tenantID.String(), customerID.String(), from, to, maxEventRows+1)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []*EventRow
 	for rows.Next() {
+		if len(out) >= maxEventRows {
+			return nil, fmt.Errorf("meter events query returned more than %d rows in [%s, %s): narrow the time range",
+				maxEventRows, from.Format(time.RFC3339), to.Format(time.RFC3339))
+		}
 		var (
 			eventIDStr string
 			md         map[string]string

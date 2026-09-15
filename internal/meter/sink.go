@@ -5,6 +5,7 @@ package meter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -37,6 +38,31 @@ func NewSinkWorker(ch driver.Conn, brokers []string, topic string, log *slog.Log
 	}
 }
 
+// 写入重试策略（有上限的指数退避）。
+//
+// 原实现为 for{} 无限重试：ClickHouse 长时间不可用时 Worker 会静默卡在 flush 内——
+// 消费停滞、不提交 offset、无告警、无失败出口，只能从 Kafka lag 侧被动发现。
+// 达上限后放弃并返回错误停止 Worker：不提交 offset，由调度层重启后重放
+// （ReplacingMergeTree 按 event_id+event_version 幂等，重放安全）。
+const (
+	sinkMaxAttempts = 5
+	sinkBaseBackoff = 3 * time.Second
+	sinkMaxBackoff  = 30 * time.Second
+)
+
+// errSinkWriteFailed 写入重试达上限：调用方应停止 Worker 并告警。
+var errSinkWriteFailed = errors.New("sink: clickhouse write failed after max attempts")
+
+// sleepCtx 可取消的等待，ctx 取消返回 false。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
 // Run 主循环：Fetch（不自动提交）→ 写 CH 成功后 Commit，保证至少一次投递语义。
 func (w *SinkWorker) Run(ctx context.Context) error {
 	batch := make([]kafka.Message, 0, 64)
@@ -44,21 +70,31 @@ func (w *SinkWorker) Run(ctx context.Context) error {
 	flushTicker := time.NewTicker(200 * time.Millisecond)
 	defer flushTicker.Stop()
 
-	flush := func() {
+	// flush 返回 false 表示本批最终写入失败：不提交 offset，调用方应停止 Worker。
+	flush := func() bool {
 		if len(events) == 0 {
-			return
+			return true
 		}
-		// 失败退避重试：不提交 offset，进程重启后重放（幂等）
-		for {
-			if err := w.writeEvents(ctx, events); err == nil {
+		backoff := sinkBaseBackoff
+		for attempt := 1; attempt <= sinkMaxAttempts; attempt++ {
+			err := w.writeEvents(ctx, events)
+			if err == nil {
 				break
-			} else {
-				w.log.Error("sink write clickhouse failed, retrying", "err", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(3 * time.Second):
-				}
+			}
+			w.log.Error("sink write clickhouse failed", "attempt", attempt, "of", sinkMaxAttempts,
+				"events", len(events), "err", err)
+			if attempt == sinkMaxAttempts {
+				w.log.Error("sink giving up: stopping worker; offsets NOT committed, "+
+					"messages will be redelivered after restart (idempotent)",
+					"events", len(events))
+				return false
+			}
+			if !sleepCtx(ctx, backoff) {
+				return false
+			}
+			backoff *= 2
+			if backoff > sinkMaxBackoff {
+				backoff = sinkMaxBackoff
 			}
 		}
 		if err := w.rdr.CommitMessages(ctx, batch...); err != nil {
@@ -66,6 +102,7 @@ func (w *SinkWorker) Run(ctx context.Context) error {
 		}
 		batch = batch[:0]
 		events = events[:0]
+		return true
 	}
 
 	for {
@@ -99,7 +136,9 @@ func (w *SinkWorker) Run(ctx context.Context) error {
 		batch = append(batch, msg)
 		events = append(events, &ev)
 		if len(events) >= 100 {
-			flush()
+			if !flush() {
+				return errSinkWriteFailed
+			}
 		}
 	}
 }

@@ -1,10 +1,131 @@
 package meter
 
 import (
+	"io"
+	"log/slog"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
+
+	"github.com/meteron/meteron/internal/ingest"
 )
+
+func newTestWorker() *MeterWorker {
+	return &MeterWorker{
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		buckets:  map[int64]*hourBucket{},
+		inflight: map[int64]struct{}{},
+	}
+}
+
+func testEvent(hour time.Time, tenant, customer uuid.UUID, tokens uint64) *ingest.MeterEvent {
+	return &ingest.MeterEvent{
+		EventID:     uuid.New(),
+		TenantID:    tenant,
+		CustomerID:  customer,
+		Timestamp:   hour.Add(time.Minute),
+		TaskType:    "chat",
+		Model:       "gpt-4o",
+		Provider:    "openai",
+		InputTokens: tokens,
+	}
+}
+
+// TestConsume_AggregateKeyIncludesTenantAndCustomer 防回归：
+// 聚合键必须包含 tenant/customer 维度。meter_events_hourly 排序键为
+// (tenant_id, customer_id, hour, task_type, model, provider)，若聚合键缺少这两个维度，
+// 不同客户（agentID 常为空，极易撞键）的用量会被累加到先到的那一行上——跨客户串账；
+// 同租户内跨客户错配时总量不变，租户级对账无法发现。
+func TestConsume_AggregateKeyIncludesTenantAndCustomer(t *testing.T) {
+	w := newTestWorker()
+	hour := time.Now().UTC().Truncate(time.Hour)
+	tenantA, tenantB := uuid.New(), uuid.New()
+	custA, custB := uuid.New(), uuid.New()
+
+	w.consume(testEvent(hour, tenantA, custA, 100))
+	w.consume(testEvent(hour, tenantB, custB, 7))
+
+	b := w.buckets[hour.Unix()]
+	if b == nil {
+		t.Fatal("hour bucket not created")
+	}
+	if len(b.agg) != 2 {
+		t.Fatalf("expected 2 aggregate rows (one per customer), got %d", len(b.agg))
+	}
+	byCustomer := map[uuid.UUID]*aggRow{}
+	for _, row := range b.agg {
+		if row.tenantID != tenantA && row.tenantID != tenantB {
+			t.Fatalf("unexpected tenant in row: %s", row.tenantID)
+		}
+		byCustomer[row.customerID] = row
+	}
+	if byCustomer[custA].inputTokens != 100 || byCustomer[custB].inputTokens != 7 {
+		t.Fatalf("tokens crossed customers: custA=%d custB=%d",
+			byCustomer[custA].inputTokens, byCustomer[custB].inputTokens)
+	}
+	if byCustomer[custA].tenantID != tenantA || byCustomer[custB].tenantID != tenantB {
+		t.Fatalf("tenant/customer mismatch: A=%s/%s B=%s/%s",
+			byCustomer[custA].tenantID, byCustomer[custA].customerID,
+			byCustomer[custB].tenantID, byCustomer[custB].customerID)
+	}
+}
+
+// TestConsume_IdempotentByEventID 同一 event_id 重复投递（Kafka 重放）只累计一次。
+func TestConsume_IdempotentByEventID(t *testing.T) {
+	w := newTestWorker()
+	hour := time.Now().UTC().Truncate(time.Hour)
+	ev := testEvent(hour, uuid.New(), uuid.New(), 50)
+
+	w.consume(ev)
+	w.consume(ev)
+	w.consume(ev)
+
+	b := w.buckets[hour.Unix()]
+	if len(b.agg) != 1 {
+		t.Fatalf("expected 1 aggregate row, got %d", len(b.agg))
+	}
+	for _, row := range b.agg {
+		if row.inputTokens != 50 {
+			t.Fatalf("duplicate delivery double counted: input_tokens=%d, want 50", row.inputTokens)
+		}
+		if row.count != 1 {
+			t.Fatalf("request_count=%d, want 1", row.count)
+		}
+	}
+}
+
+// TestBucketMerge 写入失败回写时，同小时的新桶与旧桶合并（不丢、不重复）。
+func TestBucketMerge(t *testing.T) {
+	hour := time.Now().UTC().Truncate(time.Hour)
+	tenant, customer := uuid.New(), uuid.New()
+
+	old := &hourBucket{hour: hour, agg: map[string]*aggRow{}, seenIDs: map[uuid.UUID]struct{}{}}
+	ev1 := testEvent(hour, tenant, customer, 10)
+	old.seenIDs[ev1.EventID] = struct{}{}
+	old.agg["k"] = &aggRow{tenantID: tenant, customerID: customer, inputTokens: 10, count: 1}
+
+	cur := &hourBucket{hour: hour, agg: map[string]*aggRow{}, seenIDs: map[uuid.UUID]struct{}{}}
+	ev2 := testEvent(hour, tenant, customer, 5)
+	cur.seenIDs[ev2.EventID] = struct{}{}
+	cur.agg["k"] = &aggRow{tenantID: tenant, customerID: customer, inputTokens: 5, count: 1}
+
+	cur.merge(old)
+
+	if len(cur.agg) != 1 {
+		t.Fatalf("expected merged single row, got %d", len(cur.agg))
+	}
+	if got := cur.agg["k"].inputTokens; got != 15 {
+		t.Fatalf("merged input_tokens=%d, want 15", got)
+	}
+	if got := cur.agg["k"].count; got != 2 {
+		t.Fatalf("merged count=%d, want 2", got)
+	}
+	if len(cur.seenIDs) != 2 {
+		t.Fatalf("seenIDs not merged: %d, want 2", len(cur.seenIDs))
+	}
+}
 
 func mkMsg(part int, off int64, hour int64) pendingMsg {
 	return pendingMsg{
