@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="490" viewBox="0 0 760 490" font-family="-apple-system,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <title>auto 成本分级路由决策流</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6B7280"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#2563EB"/>
+    </marker>
+  </defs>
+
+  <rect width="760" height="490" fill="#FFFFFF"/>
+
+  <!-- ===== 入口：请求 ===== -->
+  <rect x="290" y="24" width="180" height="38" rx="19" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="380" y="48" text-anchor="middle" font-size="14" font-weight="600" fill="#1F2937">请求 · model=auto</text>
+
+  <line x1="380" y1="62" x2="380" y2="84" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ===== 焦点：复杂度评估 ===== -->
+  <rect x="210" y="88" width="340" height="76" rx="8" fill="#EEF2FF" stroke="#818CF8" stroke-width="1.5"/>
+  <text x="380" y="112" text-anchor="middle" font-size="14" font-weight="600" fill="#3730A3">复杂度评估</text>
+  <text x="380" y="134" text-anchor="middle" font-size="12" fill="#4338CA">X-Meteron-Quality 头（显式优先）</text>
+  <text x="380" y="152" text-anchor="middle" font-size="12" fill="#4338CA">图片 · 工具调用 · 输入 token 估算</text>
+
+  <!-- 评估 → 三个分级 -->
+  <line x1="280" y1="164" x2="144" y2="215" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="380" y1="164" x2="380" y2="215" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="480" y1="164" x2="616" y2="215" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ===== 三个成本分级 ===== -->
+  <rect x="40" y="220" width="200" height="94" rx="8" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="140" y="248" text-anchor="middle" font-size="14" font-weight="600" fill="#1F2937">Economy</text>
+  <text x="140" y="272" text-anchor="middle" font-size="12" fill="#6B7280">短输入 · 低要求</text>
+  <text x="140" y="292" text-anchor="middle" font-size="12" fill="#6B7280">本地 Ollama — 近零成本</text>
+
+  <rect x="280" y="220" width="200" height="94" rx="8" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="380" y="248" text-anchor="middle" font-size="14" font-weight="600" fill="#1F2937">Standard</text>
+  <text x="380" y="272" text-anchor="middle" font-size="12" fill="#6B7280">输入 ≥ 2000 token</text>
+  <text x="380" y="292" text-anchor="middle" font-size="12" fill="#6B7280">GLM-4.6 等中档渠道</text>
+
+  <rect x="520" y="220" width="200" height="94" rx="8" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="620" y="248" text-anchor="middle" font-size="14" font-weight="600" fill="#1F2937">Premium</text>
+  <text x="620" y="272" text-anchor="middle" font-size="12" fill="#6B7280">图片 · 工具 · ≥ 8000 token</text>
+  <text x="620" y="292" text-anchor="middle" font-size="12" fill="#6B7280">GPT-4o / Claude 高能力</text>
+
+  <!-- 分级间降级箭头（premium → standard → economy） -->
+  <line x1="520" y1="267" x2="486" y2="267" stroke="#2563EB" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+  <line x1="280" y1="267" x2="246" y2="267" stroke="#2563EB" stroke-width="1.5" marker-end="url(#arrowBlue)"/>
+
+  <!-- 降级说明 -->
+  <text x="380" y="344" text-anchor="middle" font-size="12" fill="#2563EB">渠道不可用 / 预算水位不足时，向低成本方向降一级（premium → economy）</text>
+
+  <line x1="380" y1="356" x2="380" y2="382" stroke="#6B7280" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ===== 出口：透明转发 ===== -->
+  <rect x="200" y="386" width="360" height="68" rx="8" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <text x="380" y="412" text-anchor="middle" font-size="14" font-weight="600" fill="#1F2937">透明转发 + usage 嗅探</text>
+  <text x="380" y="436" text-anchor="middle" font-size="12" fill="#6B7280">实际用量结算 · cached tokens 差异计价 · 预算差额归还</text>
+</svg>

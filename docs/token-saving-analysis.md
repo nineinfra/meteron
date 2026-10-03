@@ -15,6 +15,11 @@ Meteron 刻意**不做** prompt 压缩、消息截断这类会真实降低 AI �
 
 ## 一、执行侧：auto 成本分级路由（核心省钱机制）
 
+![auto 成本分级路由决策流](token-saving-routing.svg)
+
+> 图源文件为 [token-saving-routing.svg](token-saving-routing.svg)（纯文本 SVG，可直接编辑）。
+> 蓝色箭头为降级方向（premium → standard → economy）；灰色箭头为主流程。
+
 ### 代码位置
 
 | 文件 | 职责 |
