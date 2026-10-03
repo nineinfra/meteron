@@ -272,3 +272,102 @@ gateway / api / health 测试用例）。
 **后续待办**：`006` 迁移要求库内无同周期重复 draft，若存在会建索引失败（故意不静默跳过），
 需先手工清理。hourly 表的历史数据仍是串账状态，需用 `meter_events FINAL` 重建
 （修复只对新事件生效）。
+
+---
+
+# 第四轮评审（全仓库复审，2026-10-01）
+
+> 评审范围：全仓库复检（gateway / ledger / pricing / billing / recon / meter /
+> ratelimit / rbac / health / api / config / store / provider / worker / main）。
+> 重点：① 核实前三轮修复是否落地；② 挖掘尚未记录的新问题。
+> 结论：前三轮 P0/P1 修复全部核实到位；本轮新发现 P1 × 3、P2 × 7，详见 §10；
+> 历史遗留未关闭项核对结果见 §11。
+
+## 10. 新发现问题清单（第四轮）
+
+### P1 — 预算超卖窗口：预留估算与实际计价脱钩（设计缺口）
+
+**位置**：`internal/gateway/handler.go`（estimateAmount）+ `internal/ledger/reservation.go`（Confirm）
+
+**问题**：预留金额按全局配置 `estimate_unit_price`（默认 0.000002/token）估算，
+与该客户实际命中的费率卡快照价格完全无关。`Confirm` 按实际金额入账且**不校验池上限**：
+`actual > estimated` 时差额为负，Redis 可用额度直接扣成穿透，但本笔请求已被放行。
+对高价模型（premium 渠道单价可达估算值的数百倍），单请求实际消耗可远超预留金额。
+README 声称"不超卖"，实际语义是"下一笔请求会被拦住，本笔已超支"。
+
+**建议**：Reserve 前先取 `pricing.ResolveSnapshot`，用快照单价 ×（输入估算 + max_tokens）
+计算预留（快照本来就要取，无额外开销）；Confirm 发现 actual > estimated 时打点
+`budget_overshoot` 指标供告警。
+
+### P1 — 无预算池时幂等键完全失效（重复计费）
+
+**位置**：`internal/gateway/handler.go`（checkTransactionExists / 步骤6）
+
+**问题**：幂等去重靠 `budget_reservations` 的 `UNIQUE(tenant_id, transaction_id)`。
+但 `pool == nil`（客户无匹配预算池）时不创建预留 → 同一 `X-Idempotency-Key` 重放
+（网络超时重试的典型场景）会通过 `checkTransactionExists` 检查，产生两条
+event_id 不同的计量事件——sink 按 event_id 幂等无法去重，出账双倍计费。
+
+**建议**：幂等占用独立于预算池（如 `idempotency_keys` 表 upsert，或无池时也写一条
+零金额预留）。
+
+### P1 — 2xx 无 usage 的非流式响应：既不计费也不审计（计量静默丢失）
+
+**位置**：`internal/gateway/handler.go`（finish 闭包）+ `internal/provider/openai.go`
+
+**问题**：OpenAI 兼容上游返回 200 但 body 缺 `usage` 字段（部分 vLLM/代理实现如此）
+时，`result.Usage == nil` → `finish` 直接 return：不 confirm（等 TTL 释放，行为正确）、
+**不发任何 meter event**。对比失败路径（4xx/5xx/网络错）都有 tokens=0 审计事件，
+成功但缺 usage 的请求在审计日志中完全不可见。另注意两适配器行为不一致：
+Anthropic 非流式恒返回零值 usage（会发 tokens=0 事件），OpenAI 适配器则直接跳过。
+
+**建议**：非流式成功但 usage 缺失时，按 tokens=0 发审计事件（与 `emitFailureEvent`
+同构），便于按 model/provider 排查上游契约异常。
+
+### P2 —（新发现，摘要表）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| 1 | 账单币种混合 | `billing/worker.go` billCustomer | `currency` 取最后一个事件的快照值，跨币种产品金额直接相加在同一币种下出账；应按币种分账单或校验拒绝 |
+| 2 | draft 重建物理删除 ledger_entries | `billing/worker.go` billCustomer | `DELETE FROM ledger_entries WHERE bill_id=...` 与"账本不可变，禁止 UPDATE"的 schema 注释冲突（draft 未定稿可重建属合理取舍，但建议改为 void 红冲或 draft 标记位，保持"只增"不变式） |
+| 3 | FinalizeBill TOCTOU | `billing/bills.go` | UPDATE 未带 `AND status IN ('draft','amending')` 守卫；Get 与 UPDATE 之间状态可能已变（如 voided），并发下可越状态定稿 |
+| 4 | 唯一约束冲突返回 500 | `api/customers.go` 等 | createCustomer/createProduct/createRateCard 等撞 `UNIQUE(tenant_id, ...)` 时应映射 409，当前 ErrInternal |
+| 5 | currency 无格式校验 | `api/customers.go` | createCustomer/updateCustomer 接受任意字符串作 currency（无 ISO-4217 三字母校验），脏数据直接进账单 |
+| 6 | 网关延迟指标仅成功路径采样 | `gateway/handler.go` | `GatewayLatencySeconds.Observe` 只在成功分支调用，失败/限流/超支请求延迟不可观测，p99 会系统性偏低 |
+| 7 | Authenticate 无负缓存 | `rbac/apikeys.go` | 无效 key 反复请求每次都打 PG（cacheGet 只缓存成功身份）；恶意扫描可放大 PG 负载 |
+
+### P3 — 细节观察（不阻塞）
+
+- `provider/anthropic.go` 非流式 `finish_reason` 直接透传（`end_turn` 等）未翻译为
+  OpenAI 的 `stop`，严格 SDK 可能不识别。
+- `config.go` `expandEnv` 对 `${UNDEFINED}` 静默展开为空串，可能悄悄清空 provider
+  api_key；建议未定义时保留原文或启动告警。
+- `Health.ErrorRateThreshold` 非法值静默回退 0.5，与其他配置"启动期拦截"策略不一致。
+- `ratelimit.MemoryLimiter.rate` map 的 key 无淘汰（仅测试替身使用，无实际影响）。
+- `apikeys.go` ListKeys LIMIT 200、customers LIMIT 100 均无分页游标。
+
+## 11. 历史遗留项状态核对（截至本轮）
+
+| 来源 | 项 | 状态 |
+|---|---|---|
+| 第二轮 #4 | requireScope 权限不足返回 401 而非 403 | **仍开放**（server.go 175-179 维持 ErrUnauthorized；测试已固化契约，属有意接受） |
+| 第二轮 #5 | admin 密钥明文存 localStorage | **仍开放** |
+| 第二轮 #6 | 幂等键占用不区分预留状态（released/expired 后同键永远 409） | **仍开放**（001 迁移仍为全量 UNIQUE，无部分索引迁移） |
+| 第二轮 #7 | audit `from` 可传 1970 绕过默认窗口；排序缺 event_id 次级键 | **仍开放**（audit.go parseAuditFilter/buildAuditQuery 已核对，无 from≤to、跨度上限与次级排序键） |
+| 第二轮 #8 | mock 渠道探测样本稀释错误率 | **仍开放**（health.go ObserveProbe 与真实流量仍混入同一样本桶） |
+| 第一轮 #2 | ClickHouse 迁移无版本化 | **仍开放** |
+| 第一轮 #5 | RLS 已 ENABLE 未建 policy | **仍开放** |
+| 第一轮 #6 | Outbox 与 confirm 非同一事务 | **仍开放**（对账兜底） |
+| 第三轮 | 限流 v2/v3、锁续期、SSE 计费脱离请求生命周期、rewriteBodyModel、模型白名单校验最终模型、失败审计事件、五次退避停 Worker、5s 鉴权缓存、1h 分片拉取 | **全部核实落地** ✅ |
+
+## 12. 本轮总体结论
+
+- **修复质量**：前三轮共 3×P0 + 10×P1 的修复全部核实到位，且多数附带回归测试与
+  根因注释（如限流 Lua 的 O(N) 演进、信号量 TTL 刷新语义），修复不是打补丁而是
+  带测试的演进。
+- **核心风险收敛**：鉴权（HMAC 单向 + 白名单 fail-closed + 缓存失效）、事件可靠性
+  （Outbox 至少一次 + 幂等 sink）、预算一致性（两阶段 + 过期释放 + 漂移校正）三条
+  主线均已闭环；本轮新发现的三个 P1 全部是**边界路径**（无池幂等、缺 usage、
+  估算脱钩），不动摇主干。
+- **建议优先级**：P1-1（快照估价）> P1-2（幂等键独立落表）> P1-3（缺 usage 审计），
+  三者均是小改动大收益；P2 表中 #1（币种混合）在多币种租户上线前必须处理。

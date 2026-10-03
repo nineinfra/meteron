@@ -20,17 +20,21 @@ import (
 const (
 	lockExpire      = "meteron:lock:scheduled:expire"
 	lockResync      = "meteron:lock:scheduled:resync"
+	lockIdemCleanup = "meteron:lock:scheduled:idem-cleanup"
 	expireBatchSize = 500
+	// idemKeyRetention 幂等键占用保留期：需覆盖调用方最大重试窗口
+	// （含网络超时+退避），默认 7 天与 outbox 保留期对齐。
+	idemKeyRetention = 7 * 24 * time.Hour
 )
 
 // ScheduledWorker 定时补偿任务集合。
 type ScheduledWorker struct {
-	db       *pgxpool.Pool
-	redis    *store.Redis
-	ledgerSt *ledger.Store
+	db        *pgxpool.Pool
+	redis     *store.Redis
+	ledgerSt  *ledger.Store
 	ledgerSvc *ledger.Service
-	cfg      *config.Config
-	log      *slog.Logger
+	cfg       *config.Config
+	log       *slog.Logger
 }
 
 func NewScheduledWorker(db *pgxpool.Pool, rds *store.Redis, ledgerSvc *ledger.Service, cfg *config.Config, log *slog.Logger) *ScheduledWorker {
@@ -41,9 +45,10 @@ func NewScheduledWorker(db *pgxpool.Pool, rds *store.Redis, ledgerSvc *ledger.Se
 	}
 }
 
-// Run 启动两个独立循环，直至 ctx 取消。
+// Run 启动三个独立循环，直至 ctx 取消。
 func (w *ScheduledWorker) Run(ctx context.Context) error {
 	go w.resyncLoop(ctx)
+	go w.idemCleanupLoop(ctx)
 	return w.expireLoop(ctx)
 }
 
@@ -112,6 +117,34 @@ func (w *ScheduledWorker) resyncLoop(ctx context.Context) {
 			}
 			w.resyncAll(ctx)
 			w.unlock(ctx, lockResync, token)
+		}
+	}
+}
+
+// idemCleanupLoop 低频循环：清理过期幂等键占用（防 idempotency_keys 无限增长）。
+func (w *ScheduledWorker) idemCleanupLoop(ctx context.Context) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			token, ok, err := w.redis.DistLock(ctx, lockIdemCleanup, 10*time.Minute)
+			if err != nil || !ok {
+				continue
+			}
+			tag, err := w.db.Exec(ctx,
+				`DELETE FROM idempotency_keys WHERE created_at < NOW() - $1::interval`,
+				idemKeyRetention.String())
+			w.unlock(ctx, lockIdemCleanup, token)
+			if err != nil {
+				w.log.Error("idempotency key cleanup failed", "err", err)
+				continue
+			}
+			if n := tag.RowsAffected(); n > 0 {
+				w.log.Info("cleaned expired idempotency keys", "count", n)
+			}
 		}
 	}
 }

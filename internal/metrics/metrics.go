@@ -40,6 +40,17 @@ var (
 		},
 	)
 
+	// BudgetOvershootTotal 实际消耗超过预留金额的确认次数。
+	// 正常路径预留按费率快照估价（与实际口径一致）应为 0；出现非零说明
+	// 估算与实际仍存在偏差（如实际输出 token 超 max_tokens 上限），
+	// 超支部分由后续请求的预算水位拦截，此处用于告警与观测。
+	BudgetOvershootTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "budget_overshoot_total",
+			Help: "Confirmations where actual amount exceeded the reserved amount",
+		},
+	)
+
 	// BillingRunDurationSeconds 分状态跑批耗时
 	BillingRunDurationSeconds = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{

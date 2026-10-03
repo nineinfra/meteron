@@ -40,9 +40,9 @@ const (
 	headerIdemKey    = "X-Idempotency-Key"
 	// 应用侧渠道选择：显式锁定上游渠道（跳过路由规则）；
 	// 质量要求（auto 模式成本路由信号）：low/medium/high → economy/standard/premium
-	headerProvider   = "X-Meteron-Provider"
-	headerQuality    = "X-Meteron-Quality"
-	modelAuto        = "auto"
+	headerProvider = "X-Meteron-Provider"
+	headerQuality  = "X-Meteron-Quality"
+	modelAuto      = "auto"
 
 	maxBodyBytes = 10 << 20 // 10MB
 )
@@ -61,8 +61,8 @@ type Handler struct {
 	db        *pgxpool.Pool
 	cfg       *config.Config
 	log       *slog.Logger
-	health    *health.Tracker       // 渠道健康（nil=未启用）
-	limiter   ratelimit.Limiter     // 双重限流（nil=未启用）
+	health    *health.Tracker   // 渠道健康（nil=未启用）
+	limiter   ratelimit.Limiter // 双重限流（nil=未启用）
 }
 
 func NewHandler(
@@ -164,9 +164,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		txnID = uuid.New()
 	}
 
-	// 幂等：同租户同 transaction_id 已存在预留 → 拒绝重复提交（防重复计费）
+	// 幂等：同租户同 transaction_id 已占用 → 拒绝重复提交（防重复计费）。
+	// 占用独立落表 idempotency_keys（ON CONFLICT DO NOTHING 原子占用）：
+	// 旧实现依赖 budget_reservations 唯一约束，客户无预算池（不建预留）时
+	// 同键重放会产生两条计量事件（双倍计费）。
 	if idemKey != "" {
-		if err := h.checkTransactionExists(ctx, ident.TenantID, txnID); err != nil {
+		if err := h.occupyIdempotencyKey(ctx, ident.TenantID, txnID); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -228,11 +231,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		route.Provider = pName
 	}
 
+	// 5.8 计价上下文快照（请求匹配成功时刻固化，前置于预算预留）：
+	// 预留金额按快照单价估算（与实际计费同口径），修复全局估价与真实费率
+	// 脱钩导致高价模型单笔远超预留的超卖窗口。路由/降级切换模型处同步重取。
+	dims := pricing.Dims{TaskType: taskType, Model: route.Model, Provider: route.Provider, AgentID: agentID}
+	snapshot, err := h.pricing.ResolveSnapshot(ctx, ident.TenantID, customerID, dims)
+	if err != nil {
+		writeErr(w, common.ErrInternal.Wrap(err))
+		return
+	}
+
 	// 6. 预算预留（reserve）；预算不足时执行预设策略（告警放行 / 拒绝 / 降级廉价模型）
 	ttl := time.Duration(h.cfg.Business.ReserveDefaultTTLSeconds) * time.Second
 	var reservation *ledger.Reservation
 	if pool != nil {
-		estAmount := h.estimateAmount(&chatReq)
+		estAmount := h.estimateAmount(snapshot, &chatReq)
 		reservation, err = h.ledgerSvc.Reserve(ctx, pool, estAmount, txnID, ttl)
 		if err != nil {
 			biz := common.FromErr(err)
@@ -247,13 +260,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"pool_id", pool.ID, "customer_id", pool.CustomerID)
 				reservation = nil
 			case "fallback":
-				// 自动降级路由廉价模型：半价预估重试预留
+				// 自动降级路由廉价模型：按 fallback 模型费率重取快照并重新估价
+				// （旧实现固定半价预估，与降级后实际计费口径脱钩）
 				if route.FallbackProvider == "" || route.FallbackModel == "" ||
 					(route.FallbackProvider == route.Provider && route.FallbackModel == route.Model) {
 					writeErr(w, common.ErrBudgetExhausted.Wrap(errors.New("no fallback model configured")))
 					return
 				}
-				reservation, err = h.ledgerSvc.Reserve(ctx, pool, estAmount.Div(decimal.NewFromInt(2)), txnID, ttl)
+				fbDims := pricing.Dims{TaskType: taskType, Model: route.FallbackModel, Provider: route.FallbackProvider, AgentID: agentID}
+				fbSnapshot, ferr := h.pricing.ResolveSnapshot(ctx, ident.TenantID, customerID, fbDims)
+				if ferr != nil {
+					writeErr(w, common.ErrInternal.Wrap(ferr))
+					return
+				}
+				reservation, err = h.ledgerSvc.Reserve(ctx, pool, h.estimateAmount(fbSnapshot, &chatReq), txnID, ttl)
 				if err != nil {
 					writeErr(w, common.FromErr(err))
 					return
@@ -261,6 +281,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.log.Warn("budget exhausted, fallback to cheaper model",
 					"pool_id", pool.ID, "from", route.Model, "to", route.FallbackModel)
 				route.Provider, route.Model = route.FallbackProvider, route.FallbackModel
+				snapshot = fbSnapshot
 			default: // block
 				writeErr(w, common.ErrBudgetExhausted)
 				return
@@ -276,6 +297,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("provider disabled by health check, fallback",
 				"from", route.Provider, "to", route.FallbackProvider)
 			route.Provider, route.Model = route.FallbackProvider, route.FallbackModel
+			// 切换模型后重取计价快照（不同模型费率不同，保证预留与计费同口径）
+			hbDims := pricing.Dims{TaskType: taskType, Model: route.Model, Provider: route.Provider, AgentID: agentID}
+			hbSnapshot, herr := h.pricing.ResolveSnapshot(ctx, ident.TenantID, customerID, hbDims)
+			if herr != nil {
+				if reservation != nil {
+					_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
+				}
+				writeErr(w, common.ErrInternal.Wrap(herr))
+				return
+			}
+			snapshot = hbSnapshot
 		} else {
 			if reservation != nil {
 				_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
@@ -317,18 +349,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 8. 计价上下文快照（请求匹配成功时刻固化）
-	dims := pricing.Dims{TaskType: taskType, Model: route.Model, Provider: route.Provider, AgentID: agentID}
-	snapshot, err := h.pricing.ResolveSnapshot(ctx, ident.TenantID, customerID, dims)
-	if err != nil {
-		if reservation != nil {
-			_, _ = h.ledgerSvc.Release(ctx, ident.TenantID, reservation.ID)
-		}
-		writeErr(w, common.ErrInternal.Wrap(err))
-		return
-	}
-
-	// 9. 转发 LLM
+	// 9. 转发 LLM（计价快照已前移至 5.8，路由/降级切换处已同步重取）
 	// 9.1 路由/降级切换模型后重写请求体 model 字段：上游按 body.model 实际执行，
 	// 不重写会导致转发模型与定价/白名单校验模型不一致（按 B 模型费率给 A 模型计费），
 	// 且 fallback 渠道不承载原模型时上游直接 404/400，降级路由形同虚设。
@@ -401,7 +422,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", result.ContentType)
 		w.WriteHeader(result.StatusCode)
 		_, _ = w.Write(result.Body)
-		finish(result.Usage)
+		if result.Usage == nil {
+			// 上游 2xx 但缺 usage 字段（部分 vLLM/代理实现如此）：发 tokens=0
+			// 审计事件（metadata 标记 missing_usage，可按模型/渠道排查上游契约异常）。
+			// 不 confirm——无用量数据，预留等待过期释放（与流式中断同语义）。
+			h.emitMissingUsageEvent(ctx, ident.TenantID, customerID, txnID, route, taskType, agentID,
+				snapshot, body, reservation, idemKey, chatReq.Model, result.StatusCode)
+		} else {
+			finish(result.Usage)
+		}
 	}
 	metrics.GatewayLatencySeconds.Observe(time.Since(start).Seconds())
 }
@@ -443,11 +472,11 @@ func (h *Handler) proxyStream(w http.ResponseWriter, stream io.ReadCloser, onFin
 // ---- helpers ----
 
 type chatRequest struct {
-	Model       string          `json:"model"`
-	Messages    []chatMessage   `json:"messages"`
-	MaxTokens   *int            `json:"max_tokens"`
-	Stream      bool            `json:"stream"`
-	Tools       json.RawMessage `json:"tools"` // 工具调用（auto 路由复杂度信号：tools 非空 → premium）
+	Model     string          `json:"model"`
+	Messages  []chatMessage   `json:"messages"`
+	MaxTokens *int            `json:"max_tokens"`
+	Stream    bool            `json:"stream"`
+	Tools     json.RawMessage `json:"tools"` // 工具调用（auto 路由复杂度信号：tools 非空 → premium）
 }
 
 // maxTokensLimit max_tokens 合法上限：拒绝天文数字（如 MaxInt64 会让
@@ -551,7 +580,37 @@ func (m chatMessage) textLen() int {
 	return 0
 }
 
-func (h *Handler) estimateAmount(req *chatRequest) decimal.Decimal {
+// estimateAmount 按计价快照单价估算本次请求的预留金额（与实际计费同口径）：
+// 输入估算 token × input 单价 + 输出上限（max_tokens 或默认值）× output 单价，
+// 再应用快照折扣。tiered 以首档单价近似（与 EventCost 单事件口径一致，
+// 出账按累计阶梯精确重算）。零价快照（未命中费率规则）估算为 0——实际计费
+// 亦为 0，口径一致；高价模型预留随真实费率水涨船高，封住超卖窗口。
+// snap 为 nil 时回退全局配置单价（防御路径）。
+func (h *Handler) estimateAmount(snap *pricing.Snapshot, req *chatRequest) decimal.Decimal {
+	if snap == nil {
+		return h.estimateAmountByConfig(req)
+	}
+	in, errIn := decimal.NewFromString(snap.InputUnitPrice)
+	if errIn != nil {
+		in = decimal.Zero
+	}
+	out, errOut := decimal.NewFromString(snap.OutputUnitPrice)
+	if errOut != nil {
+		out = decimal.Zero
+	}
+	est := in.Mul(decimal.NewFromInt(int64(h.estimateInputTokens(req)))).
+		Add(out.Mul(decimal.NewFromInt(int64(h.estimateOutputCeiling(req)))))
+	if d, derr := decimal.NewFromString(snap.Discount); derr == nil && !d.IsZero() {
+		est = est.Mul(decimal.NewFromInt(1).Sub(d))
+	}
+	if est.IsNegative() { // 非法负单价配置：钳为 0，避免 Reserve 拒绝整个请求
+		return decimal.Zero
+	}
+	return est
+}
+
+// estimateAmountByConfig 全局配置单价估算（仅 snap==nil 防御路径）。
+func (h *Handler) estimateAmountByConfig(req *chatRequest) decimal.Decimal {
 	price, err := decimal.NewFromString(h.cfg.Business.EstimateUnitPrice)
 	if err != nil {
 		price = decimal.Zero
@@ -559,9 +618,8 @@ func (h *Handler) estimateAmount(req *chatRequest) decimal.Decimal {
 	return price.Mul(decimal.NewFromInt(int64(h.estimateTokens(req))))
 }
 
-// estimateTokens 预估本次请求 token 数：输入字符折算 + max_tokens 上限。
-// 供预算预留与 TPM 限流共用。
-func (h *Handler) estimateTokens(req *chatRequest) uint64 {
+// estimateInputTokens 输入 token 估算（消息字符折算）。
+func (h *Handler) estimateInputTokens(req *chatRequest) uint64 {
 	chars := 0
 	for _, m := range req.Messages {
 		chars += m.textLen()
@@ -570,12 +628,25 @@ func (h *Handler) estimateTokens(req *chatRequest) uint64 {
 	if cpt <= 0 {
 		cpt = 4
 	}
-	estTokens := uint64(chars/cpt + 1)
+	return uint64(chars/cpt + 1)
+}
+
+// estimateOutputCeiling 输出 token 上限估算（max_tokens 或默认值）。
+func (h *Handler) estimateOutputCeiling(req *chatRequest) int {
 	maxTok := h.cfg.Business.EstimateDefaultMaxTokens
 	if req.MaxTokens != nil && *req.MaxTokens > 0 {
 		maxTok = *req.MaxTokens
 	}
-	return estTokens + uint64(maxTok)
+	if maxTok < 0 {
+		maxTok = 0
+	}
+	return maxTok
+}
+
+// estimateTokens 预估本次请求 token 数：输入字符折算 + max_tokens 上限。
+// 供 TPM 限流与配置兜底估价共用。
+func (h *Handler) estimateTokens(req *chatRequest) uint64 {
+	return h.estimateInputTokens(req) + uint64(h.estimateOutputCeiling(req))
 }
 
 // clientIP 提取来源 IP（密钥 IP 白名单的判定依据）。
@@ -665,6 +736,27 @@ func (h *Handler) emitFailureEvent(
 	}
 }
 
+// emitMissingUsageEvent 上游 2xx 但响应缺 usage 字段的审计事件：
+// tokens=0、status_code 如实记录、metadata 标记 missing_usage——
+// 便于按 model/provider 检索上游契约异常（正常成功事件的 usage 不会缺失）。
+// 不产生费用（预留不 confirm，等待 TTL 过期释放，与流式中断同语义）。
+func (h *Handler) emitMissingUsageEvent(
+	ctx context.Context,
+	tenantID, customerID, txnID uuid.UUID,
+	route *router.RouteResult, taskType, agentID string,
+	snapshot *pricing.Snapshot, rawBody []byte,
+	reservation *ledger.Reservation, idemKey, requestedModel string,
+	statusCode int,
+) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	ev := h.buildEvent(tenantID, customerID, txnID, route, taskType, agentID, snapshot, nil, rawBody, reservation, idemKey, requestedModel, statusCode)
+	ev.Metadata["missing_usage"] = "true"
+	if perr := h.producer.Produce(fctx, ev); perr != nil {
+		h.log.Error("produce missing-usage audit event failed", "event_id", ev.EventID, "err", perr)
+	}
+}
+
 func (h *Handler) poolAvailRatio(ctx context.Context, pool *ledger.Pool) float64 {
 	spent, pending, err := h.ledgerSt.SpentAndPending(ctx, pool.ID)
 	if err != nil {
@@ -706,15 +798,20 @@ func (h *Handler) resolveCustomer(ctx context.Context, tenantID uuid.UUID, ref s
 	return uuid.Parse(idStr)
 }
 
-func (h *Handler) checkTransactionExists(ctx context.Context, tenantID, txnID uuid.UUID) error {
-	var exists bool
-	err := h.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM budget_reservations WHERE tenant_id=$1::uuid AND transaction_id=$2::uuid)`,
-		tenantID.String(), txnID.String()).Scan(&exists)
+// occupyIdempotencyKey 幂等键占用（独立于预算预留）：
+// INSERT ... ON CONFLICT DO NOTHING 原子占用，冲突（RowsAffected=0）→ 重复提交。
+// 占用与是否命中预算池无关——无池请求同样受保护，修复同 X-Idempotency-Key
+// 重放产生双倍计量的问题。占用记录由 ScheduledWorker 按保留期清理
+// （见 worker.CleanupIdempotencyKeys）。
+func (h *Handler) occupyIdempotencyKey(ctx context.Context, tenantID, txnID uuid.UUID) error {
+	tag, err := h.db.Exec(ctx, `
+INSERT INTO idempotency_keys (tenant_id, transaction_id)
+VALUES ($1::uuid, $2::uuid)
+ON CONFLICT DO NOTHING`, tenantID.String(), txnID.String())
 	if err != nil {
 		return common.ErrInternal.Wrap(err)
 	}
-	if exists {
+	if tag.RowsAffected() == 0 {
 		return common.ErrDuplicateTransaction
 	}
 	return nil

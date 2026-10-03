@@ -281,8 +281,16 @@ WHERE id=$2::uuid AND status='pending'`, actual.String(), reservationID.String()
 	res.Status = StatusConfirmed
 	res.ActualAmount = actual
 
-	// Redis 归还差额（estimated - actual）
+	// Redis 归还差额（estimated - actual）。
+	// diff < 0 表示实际消耗超过预留：请求已放行（无法回滚），超支部分由后续
+	// 请求的预算水位拦截；此处打点供告警与观测（正常按快照估价时不应出现）。
 	diff := res.EstimatedAmount.Sub(actual)
+	if diff.IsNegative() {
+		metrics.BudgetOvershootTotal.Inc()
+		s.log.Warn("reservation overshoot: actual exceeds estimated",
+			"reservation_id", reservationID, "pool_id", res.PoolID,
+			"estimated", res.EstimatedAmount, "actual", actual)
+	}
 	s.addBack(ctx, res.PoolID, diff)
 
 	metrics.BudgetReservationConfirmedTotal.Inc()
@@ -350,8 +358,8 @@ FOR UPDATE SKIP LOCKED`, limit)
 		return 0, err
 	}
 	type expired struct {
-		id      uuid.UUID
-		poolID  uuid.UUID
+		id       uuid.UUID
+		poolID   uuid.UUID
 		reserved decimal.Decimal
 	}
 	var batch []expired
